@@ -1,0 +1,3 @@
+# Preserve pinned third-party bytes (including CRLF) and patch context verbatim.
+vendor/** -text -whitespace
+games/totk/tools/totk_xlate/patches/*.patch -text -whitespace

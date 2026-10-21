@@ -1,0 +1,55 @@
+.DS_Store
+__pycache__/
+*.pyc
+# never commit keys or game files
+*.keys
+*.xci
+*.nsp
+*.nca
+*.nsz
+*.xcz
+*.bfttf
+*.sav
+# build output (the work folder normally lives next to the card image)
+TOTK_build/
+*.app/
+games/totk/.venv
+games/totk/build/
+games/totk/extracted/
+games/totk/rewritten/
+games/totk/analysis/
+games/totk/tooling/
+games/totk/user-data/
+games/totk/tools/totk_xlate/obj/
+games/totk/tools/totk_xlate/bin/
+games/totk/scripts/shader_inventory/obj/
+games/totk/scripts/shader_inventory/bin/
+
+# Personal build inputs and outputs (all generated game data stays local).
+/work/
+/dist/
+/inputs/
+/outputs/
+/backups/
+/signing/
+*.ipa
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.pfx
+*.cer
+*.key
+*.pem
+*.log
+.env
+.env.*
+**/gameplay_audio_fingerprints.h
+**/gameplay_extra_audio.h
+**/gameplay_haptic_patterns.h
+**/gameplay_dialogue_flows.h
+**/project.generated.yml
+**/Gen/
+**/*.xcodeproj/
+
+# Host translator is built from source into the private work tree.
+/games/totk/prebuilt/macos-arm64/totk_xlate

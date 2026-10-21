@@ -1,0 +1,110 @@
+{
+  "schema": 1,
+  "validated_on": "2026-10-21",
+  "source_upstream_revision": "15b1afd6255ec777ebceee0c62d33ab90861b07e",
+  "scope": "Source publication tooling; previous physical-device observations remain separately scoped in docs/validation.md.",
+  "source_checks": {
+    "python_unit_tests": 120,
+    "python_unit_tests_result": "passed",
+    "feedback_c_programs": 5,
+    "feedback_c_programs_result": "passed with freshly generated local headers",
+    "native_parser_ubsan_programs": 2,
+    "native_parser_ubsan_result": "passed",
+    "code_audit": "no remaining substantive findings",
+    "publication_tree_audit": "passed",
+    "shader_cache_regression_tests": 5,
+    "shader_cache_regression_result": "passed as part of the full 120-test suite",
+    "reachable_history_audit": "The Source regressions workflow scans every reachable commit; pre-push results are also recorded in the private publication status."
+  },
+  "input_verification": {
+    "game_version": "1.0.0",
+    "title_id": "0100F2C0115B6000",
+    "input_format": "nsp",
+    "romfs_sha256": "4751542f544d8c3406cb63ccfc68b42690ff0387228d1f0af021d1f0037dafcf",
+    "npdm_sha256": "e78c40978c23b42866973e6fe506c2ad7716ec51c651f35bfeada3415bb3b634",
+    "known_unused_metadata_variant": true,
+    "rewritten_sha256": {
+      "main.patched.bin": "5553c4124bfff15094d4def00894ddccc3a48ee9a2cd4cea06ca8f8c48359ccc",
+      "sdk.patched.bin": "01402184940ea2b308005f30a5be087244fb7da739976a1bde084822604b1ef8",
+      "subsdk0.patched.bin": "43734d4172885a17088754227b7fc66b13c5f2421679c37dac23a4aa3dc84459"
+    }
+  },
+  "metadata_exception": "Only the exact known unused NPDM variant was accepted. Its Nintendo ACID signature is invalid. It is not embedded; executable, rewrite and complete RomFS gates passed.",
+  "feedback": {
+    "generated_privately": true,
+    "headers_match_reviewed_outputs": {
+      "gameplay_audio_fingerprints.h": "e5d6760e995394e3ae2df8b0ecfbea6f47ab802a3c4ab8b2ba65f26cff866c74",
+      "gameplay_dialogue_flows.h": "d4b32d6c5ef83241c3a539769660099cbed054b1eb7490bf87a6afb9f11cd464",
+      "gameplay_extra_audio.h": "9b956e99b5c90dc2ddf4291e1830aaf849601ebc911700a537aa4e714102e60e",
+      "gameplay_haptic_patterns.h": "e313568c27e59d23c5bec8f572a5fea7c057de3867551932bc76f39b962e159f"
+    },
+    "headers_distributed": false
+  },
+  "build": {
+    "status": "passed",
+    "host": "Apple silicon macOS",
+    "dotnet_sdk": "10.0.402",
+    "ios_sdk": "iPhoneOS27.1.sdk",
+    "translator_built_from_source": true,
+    "translator_binary_distributed": false,
+    "personal_team_signing_requested": false,
+    "device_install_requested": false,
+    "host_os": "macOS 27.0 arm64",
+    "xcode": "27.1 (27A9275)",
+    "python": "3.14.6",
+    "cold_ipad_build": "passed",
+    "final_ipad_driver": "passed",
+    "final_ipad_package": {
+      "display": "ipad",
+      "bundle_id": "org.example.totk.publication",
+      "build": "18",
+      "aspect": "4:3",
+      "maximum": "2752x2064",
+      "resolution_default": "1080",
+      "complete_packaged_romfs_sha256": "passed",
+      "all_shader_manifest_entries_sha256": "passed",
+      "ios_metallibs": 19892,
+      "increased_memory_entitlement": true,
+      "personal_team_signing": false,
+      "npdm_or_keys_in_app": false,
+      "executable_sha256": "3ae88ad38e5294d2597cb4522358571a25a0e77bb06d9ee4d3fb3aedc8826bea"
+    },
+    "ios_dependencies": {
+      "opus_commit": "22244de5a79bd1d6d623c32e72bf1954b56235be",
+      "libvpx_commit": "1024874c5919305883187e2953de8fcb4c3d7fa6",
+      "libraries": {
+        "libopus.a": "5a5b725810059d8145fd8f5cf662070444bbb36ee2231ac770fe8a9036c02382",
+        "libvpx.a": "fe843c43c69194e238ddb75a343bae9fe2f5fe922d30d2d6901f6c74536cea23"
+      },
+      "sdk": "iPhoneOS27.1.sdk"
+    },
+    "final_iphone_driver": "passed",
+    "final_iphone_package": {
+      "display": "iphone",
+      "bundle_id": "org.example.totk.publication",
+      "build": "18",
+      "aspect": "239:110",
+      "maximum": "1920x1080",
+      "resolution_default": "1080",
+      "complete_packaged_romfs_sha256": "passed",
+      "all_shader_manifest_entries_sha256": "passed",
+      "ios_metallibs": 19892,
+      "increased_memory_entitlement": true,
+      "personal_team_signing": false,
+      "npdm_or_keys_in_app": false,
+      "executable_sha256": "1d8aab818fa02f7192e2c13c058557ce59f0bcccd29f665253a1b0c94e62d3dd"
+    },
+    "iphone_cloud_configuration": {
+      "container": "iCloud.org.example.totk.publication",
+      "info_and_development_entitlements_match": true,
+      "live_cloud_transaction_exercised": false
+    },
+    "code_signature_scope": "Temporary local ad-hoc executable signature; no Apple team provisioning or device installation requested."
+  },
+  "proof_limits": [
+    "No physical device app was replaced during publication.",
+    "Generic personal signing and CloudKit are source-tested; no new Apple account, profile or live CloudKit transaction was exercised.",
+    "NSP input was exercised with real local game data. XCI parsing has synthetic tests but no fresh real-XCI build in this publication task.",
+    "Compiler and SDK output hashes are local evidence, not a claim of byte identity across toolchains."
+  ]
+}

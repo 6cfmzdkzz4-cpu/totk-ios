@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PreferenceSpecifiers</key>
+	<array>
+		<dict>
+			<key>FooterText</key>
+			<string>Restart Tears of the Kingdom after changing resolution. Choose a lower resolution for smoother performance. The game fills this iPad's 4:3 screen.</string>
+			<key>Title</key>
+			<string>Display</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<string>1080</string>
+			<key>Key</key>
+			<string>TOTKResolution</string>
+			<key>Title</key>
+			<string>Resolution</string>
+			<key>Titles</key>
+			<array>
+				<string>Native (2752 × 2064)</string>
+				<string>2560 × 1920</string>
+				<string>1920 × 1440</string>
+				<string>1280 × 960</string>
+			</array>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
+			<key>Values</key>
+			<array>
+				<string>native</string>
+				<string>1440</string>
+				<string>1080</string>
+				<string>720</string>
+			</array>
+		</dict>
+		<dict>
+			<key>FooterText</key>
+			<string>Native game rumble drives controller haptics and DualSense trigger feedback. Gyro aiming follows the game setting. Restart after changing these options.</string>
+			<key>Title</key>
+			<string>Controller</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<true/>
+			<key>Key</key>
+			<string>TOTKControllerHaptics</string>
+			<key>Title</key>
+			<string>Controller haptics</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<true/>
+			<key>Key</key>
+			<string>TOTKAdaptiveTriggers</string>
+			<key>Title</key>
+			<string>Adaptive triggers</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<true/>
+			<key>Key</key>
+			<string>TOTKGyroAiming</string>
+			<key>Title</key>
+			<string>Gyro aiming</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<real>0.9</real>
+			<key>Key</key>
+			<string>TOTKFeedbackStrength</string>
+			<key>MaximumValue</key>
+			<real>1.0</real>
+			<key>MinimumValue</key>
+			<real>0.0</real>
+			<key>ShowValue</key>
+			<true/>
+			<key>Title</key>
+			<string>Haptic strength</string>
+			<key>Type</key>
+			<string>PSSliderSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<real>0.55</real>
+			<key>Key</key>
+			<string>TOTKTriggerStrength</string>
+			<key>MaximumValue</key>
+			<real>1.0</real>
+			<key>MinimumValue</key>
+			<real>0.0</real>
+			<key>ShowValue</key>
+			<true/>
+			<key>Title</key>
+			<string>Trigger strength</string>
+			<key>Type</key>
+			<string>PSSliderSpecifier</string>
+		</dict>
+	</array>
+	<key>StringsTable</key>
+	<string>Root</string>
+</dict>
+</plist>

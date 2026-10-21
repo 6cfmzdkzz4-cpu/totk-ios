@@ -1,0 +1,2 @@
+# Structured EventFlow parsing. Runtime verification also checks the exact evfl/*.py source-tree digest.
+evfl @ git+https://github.com/zeldamods/evfl.git@e996fb18b389d584811f7653ca0646074b404d59
