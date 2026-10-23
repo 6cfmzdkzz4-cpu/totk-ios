@@ -16,7 +16,8 @@ FORBIDDEN_PARTS = {'node_modules', '.venv', 'extracted', 'rewritten', 'user-data
     'backups', 'DerivedData', '_CodeSignature', 'GameData', 'Gen', 'inputs', 'outputs'}
 GENERATED_HEADERS = {'gameplay_audio_fingerprints.h', 'gameplay_extra_audio.h',
     'gameplay_haptic_patterns.h', 'gameplay_dialogue_flows.h', 'runtime_tables.h',
-    'romfs_config.h', 'shared_fonts_config.h', 'embed.S'}
+    'romfs_config.h', 'shared_fonts_config.h', 'totk_live_layouts.h',
+    'totk-live-display-metadata.json', 'embed.S'}
 PATTERNS = [
     ('GitHub credential', re.compile(rb'gh[opsu]_[A-Za-z0-9]{24,}')),
     ('AWS access identifier', re.compile(rb'AKIA[A-Z0-9]{16}')),
@@ -83,11 +84,34 @@ def audit_history():
     return count, errors
 
 
+def audit_staged():
+    """Inspect the index blobs themselves, including partially staged files."""
+    errors, count = [], 0
+    for entry in git('ls-files', '--stage', '-z').split(b'\0'):
+        if not entry:
+            continue
+        info, raw_name = entry.split(b'\t', 1)
+        mode, oid, stage = info.split()
+        name = raw_name.decode()
+        count += 1
+        if stage != b'0' or mode not in (b'100644', b'100755', b'120000'):
+            errors.append((name, 'unmerged or non-blob index member'))
+            continue
+        data = git('cat-file', 'blob', oid.decode())
+        errors += [(name, issue) for issue in violations(name, data, mode == b'120000')]
+    return count, errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--history', action='store_true', help='also scan all reachable Git commits before pushing')
+    parser.add_argument('--staged', action='store_true', help='also scan the exact staged index blobs')
     args = parser.parse_args()
     count, errors = audit_current()
+    if args.staged:
+        staged_count, staged_errors = audit_staged()
+        count += staged_count
+        errors += staged_errors
     if args.history:
         history_count, history_errors = audit_history()
         count += history_count

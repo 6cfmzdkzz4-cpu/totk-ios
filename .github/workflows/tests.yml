@@ -39,5 +39,7 @@ jobs:
 
       - name: Check controller feedback policies without game data
         run: python tools/test_feedback_policy.py
+      - name: Check cloud durability and retry paths with synthetic saves
+        run: python games/totk/tests/cloud_coordinator/run.py
       - name: Audit publication tree and reachable history
         run: python tools/audit_publication.py --history

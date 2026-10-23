@@ -48,3 +48,8 @@ int fps_overlay_value(void);
 /* The same for interpolated frames shown (n counts them); fps_overlay_gen_value() is that rate, or -1. */
 void fps_overlay_note_gen(uint64_t n, double now_s);
 int fps_overlay_gen_value(void);
+/* Successful drawable presentations only. Total includes generated frames;
+   generated is its subset. UIKit samples these monotonically increasing counts. */
+void fps_overlay_note_displayed(double presented_s, int generated);
+uint64_t fps_overlay_displayed_frames(void);
+uint64_t fps_overlay_generated_frames(void);

@@ -10,13 +10,17 @@
 @property(copy) NSString *profile;
 @property(copy) NSString *directory;
 @property(strong) NSMutableDictionary *state;
+@property(strong) NSMutableDictionary *pendingState; // serial queue: confirmed ancestry awaiting persistence
 @property(strong) NSLock *snapshotLock;
+@property(strong) NSLock *journalLock; // local journal write/publication only; never a network wait
+@property(copy) NSString *journaledDigest; // journalLock; nil after failure or process restart
 @property(strong) NSDictionary *latest;
 @property(copy) NSString *detail;
 @property(weak) UIViewController *controller;
 @property BOOL started;
 @property BOOL syncScheduled;
 @property(strong) NSTimer *timer;
+- (NSDictionary *)snapshotForSync:(NSError **)error;
 @end
 
 static NSError *cloudError(NSString *message) {
@@ -40,7 +44,7 @@ static NSString *configuredCloudContainer(void) {
 - (instancetype)init {
     if((self=[super init])) {
         _queue=dispatch_queue_create("org.macnativegames.totk.cloud-save",DISPATCH_QUEUE_SERIAL);
-        _snapshotLock=[NSLock new];
+        _snapshotLock=[NSLock new];_journalLock=[NSLock new];
         NSString *docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
         _profile=[docs stringByAppendingPathComponent:@"save"];
         _directory=[docs stringByAppendingPathComponent:@"iCloudSync"];
@@ -56,8 +60,18 @@ static NSString *configuredCloudContainer(void) {
         }
     } return self;
 }
-- (void)saveState {
-    [self.state writeToFile:[self.directory stringByAppendingPathComponent:@"state.plist"] atomically:YES];
+- (BOOL)saveState:(NSMutableDictionary *)next error:(NSError **)error {
+    if(![next writeToFile:[self.directory stringByAppendingPathComponent:@"state.plist"] atomically:YES]) {
+        if(error)*error=cloudError(@"Could not persist iCloud sync state. Local progress is retained; retrying automatically.");
+        return NO;
+    }
+    self.state=next;return YES;
+}
+- (NSDictionary *)snapshot {
+    [self.snapshotLock lock];NSDictionary *save=self.latest;[self.snapshotLock unlock];return save;
+}
+- (void)publish:(NSDictionary *)save {
+    [self.snapshotLock lock];self.latest=save;[self.snapshotLock unlock];
 }
 - (void)setMessage:(NSString *)status detail:(NSString *)detail {
     fprintf(stderr,"[totk-cloud] %s: %s\n",status.UTF8String,detail.UTF8String);
@@ -71,6 +85,12 @@ static NSString *configuredCloudContainer(void) {
 }
 - (CKRecordID *)recordID { return [[CKRecordID alloc] initWithRecordName:@"totk-save-format-1"]; }
 - (BOOL)checkAccount:(NSError **)error {
+    // Retain a server-confirmed base in memory until it can be persisted. This
+    // prevents our own prior upload looking like remote divergence on retry.
+    if(self.pendingState) {
+        if(![self saveState:self.pendingState error:error])return NO;
+        self.pendingState=nil;
+    }
     dispatch_semaphore_t done=dispatch_semaphore_create(0);
     __block CKRecordID *user=nil; __block NSError *failure=nil;
     [self.container fetchUserRecordIDWithCompletionHandler:^(CKRecordID *recordID,NSError *e){user=recordID;failure=e;dispatch_semaphore_signal(done);}];
@@ -78,7 +98,8 @@ static NSString *configuredCloudContainer(void) {
     if(failure || !user) {if(error)*error=failure ?: cloudError(@"Sign in to iCloud to sync saves.");return NO;}
     NSString *previous=self.state[@"cloudUser"];
     if(previous && ![previous isEqual:user.recordName]) {if(error)*error=cloudError(@"The iCloud account changed. Sync is paused to protect the saves on both accounts.");return NO;}
-    self.state[@"cloudUser"]=user.recordName;[self saveState];return YES;
+    NSMutableDictionary *next=[self.state mutableCopy];next[@"cloudUser"]=user.recordName;
+    return [self saveState:next error:error];
 }
 - (CKRecord *)fetchRecordWithAsset:(BOOL)asset error:(NSError **)error {
     CKFetchRecordsOperation *operation=[[CKFetchRecordsOperation alloc] initWithRecordIDs:@[self.recordID]];
@@ -102,10 +123,13 @@ static NSString *configuredCloudContainer(void) {
     if(save && ![save[@"digest"] isEqual:record[@"digest"]]){if(error)*error=cloudError(@"The iCloud save checksum did not match.");return nil;}
     return save;
 }
-- (void)acknowledge:(NSDictionary *)save {
-    self.state[@"baseDigest"]=save[@"digest"];self.state[@"lastSynced"]=NSDate.date;
-    [self saveState];
+- (BOOL)acknowledge:(NSDictionary *)save error:(NSError **)error {
+    NSMutableDictionary *next=[self.state mutableCopy];
+    next[@"baseDigest"]=save[@"digest"];next[@"lastSynced"]=NSDate.date;
+    if(![self saveState:next error:error]){self.pendingState=next;return NO;}
+    self.pendingState=nil;
     [self setMessage:@"Synced with iCloud" detail:@"Your latest committed save is in iCloud. Close this game before continuing on another device."];
+    return YES;
 }
 - (BOOL)upload:(NSDictionary *)save replacing:(CKRecord *)record error:(NSError **)error {
     NSData *data=TOTKEncodeSave(save,error);if(!data)return NO;
@@ -125,7 +149,7 @@ static NSString *configuredCloudContainer(void) {
     if(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,45*NSEC_PER_SEC))){[operation cancel];if(error)*error=cloudError(@"iCloud upload timed out. Your save will retry automatically.");return NO;}
     [NSFileManager.defaultManager removeItemAtPath:file error:nil];
     if(failure || !saved){if(error)*error=failure ?: cloudError(@"iCloud did not confirm this upload.");return NO;}
-    [self acknowledge:save];return YES;
+    return [self acknowledge:save error:error];
 }
 - (NSString *)sync:(NSDictionary *)local boot:(BOOL)boot error:(NSError **)error {
     if(![self checkAccount:error])return @"error";
@@ -133,7 +157,7 @@ static NSString *configuredCloudContainer(void) {
     NSString *remoteDigest=head[@"digest"];
     if(head && ![remoteDigest isKindOfClass:NSString.class]){if(error)*error=cloudError(@"Invalid iCloud save metadata.");return @"error";}
     NSString *decision=TOTKSaveDecision(local[@"digest"],self.state[@"baseDigest"],remoteDigest);
-    if([decision isEqual:@"equal"]){[self acknowledge:local];return @"done";}
+    if([decision isEqual:@"equal"])return [self acknowledge:local error:error]?@"done":@"error";
     if([decision isEqual:@"empty"]){[self setMessage:@"Ready for iCloud" detail:@"Your first in-game save will sync automatically."];return @"done";}
     if([decision isEqual:@"upload"]){return [self upload:local replacing:head error:error]?@"done":@"error";}
     // A complete asset is downloaded only for an import or conflict backup, never on every poll.
@@ -142,8 +166,9 @@ static NSString *configuredCloudContainer(void) {
     if(![remote[@"digest"] isEqual:remoteDigest]){if(error)*error=cloudError(@"The other device saved again. Please retry sync.");return @"error";}
     if([decision isEqual:@"download"] && boot) {
         if(!TOTKRestoreSave(remote,self.profile,[self.directory stringByAppendingPathComponent:@"Backups"],error))return @"error";
-        [self.snapshotLock lock];self.latest=remote;[self.snapshotLock unlock];
-        [self acknowledge:remote];return @"done";
+        [self publish:remote];
+        if(![self snapshotForSync:error])return @"error";
+        return [self acknowledge:remote error:error]?@"done":@"error";
     }
     if(local) [TOTKEncodeSave(local,nil) writeToFile:[self.directory stringByAppendingPathComponent:@"local-conflict.plist"] options:NSDataWritingAtomic error:nil];
     if(remote) [TOTKEncodeSave(remote,nil) writeToFile:[self.directory stringByAppendingPathComponent:@"cloud-conflict.plist"] options:NSDataWritingAtomic error:nil];
@@ -164,8 +189,8 @@ static NSString *configuredCloudContainer(void) {
     }
     dispatch_async(self.queue,^{@autoreleasepool {
         NSError *error=nil;NSDictionary *local=TOTKReadSave(self.profile,nil);
-        [self.snapshotLock lock];self.latest=local;[self.snapshotLock unlock];
-        NSString *result=[self sync:local boot:YES error:&error];
+        [self publish:local];local=[self snapshotForSync:&error];
+        NSString *result=error?@"error":[self sync:local boot:YES error:&error];
         if(error)[self setMessage:@"iCloud sync pending" detail:error.localizedDescription];
         dispatch_async(dispatch_get_main_queue(),^{
             if([result isEqual:@"done"]){[self finishBoot:completion];return;}
@@ -188,8 +213,11 @@ static NSString *configuredCloudContainer(void) {
         if(!error && remote) {
             if(useCloud) {
                 ok=TOTKRestoreSave(remote,self.profile,[self.directory stringByAppendingPathComponent:@"Backups"],&error);
-                if(ok){[self.snapshotLock lock];self.latest=remote;[self.snapshotLock unlock];[self acknowledge:remote];}
-            } else {ok=[self upload:self.latest replacing:head error:&error];}
+                if(ok){[self publish:remote];ok=[self snapshotForSync:&error] && [self acknowledge:remote error:&error];}
+            } else {
+                NSDictionary *local=[self snapshotForSync:&error];
+                if(!error)ok=[self upload:local replacing:head error:&error];
+            }
         }
         if(!ok)[self setMessage:@"iCloud sync pending" detail:error.localizedDescription ?: @"Could not resolve the save; both copies are preserved."];
         dispatch_async(dispatch_get_main_queue(),^{
@@ -208,8 +236,8 @@ static NSString *configuredCloudContainer(void) {
     self.syncScheduled=YES;[self.snapshotLock unlock];
     dispatch_async(self.queue,^{@autoreleasepool {
         // Read the newest commit when the work executes; a queued timer must never upload an older snapshot.
-        [self.snapshotLock lock];NSDictionary *snapshot=self.latest;[self.snapshotLock unlock];
-        NSError *error=nil;NSString *result=[self sync:snapshot boot:NO error:&error];
+        NSError *error=nil;NSDictionary *snapshot=[self snapshotForSync:&error];
+        NSString *result=error?@"error":[self sync:snapshot boot:NO error:&error];
         if(error)[self setMessage:@"iCloud sync pending" detail:error.localizedDescription];
         // Background sync stays silent; a conflicting save is preserved for the next startup choice.
         [self.snapshotLock lock];self.syncScheduled=NO;BOOL newer=![self.latest[@"digest"] isEqual:snapshot[@"digest"]] && self.latest!=nil;[self.snapshotLock unlock];
@@ -227,14 +255,30 @@ static NSString *configuredCloudContainer(void) {
         if(task!=UIBackgroundTaskInvalid){[UIApplication.sharedApplication endBackgroundTask:task];task=UIBackgroundTaskInvalid;}
     });});
 }
+- (BOOL)writeJournal:(NSDictionary *)save error:(NSError **)error {
+    NSData *encoded=TOTKEncodeSave(save,error);if(!encoded)return NO;
+    return [encoded writeToFile:[self.directory stringByAppendingPathComponent:@"last-committed.plist"] options:NSDataWritingAtomic error:error];
+}
+- (NSDictionary *)snapshotForSync:(NSError **)error {
+    [self.journalLock lock];NSDictionary *save=[self snapshot];
+    if(save && ![self.journaledDigest isEqual:save[@"digest"]]) {
+        if(![self writeJournal:save error:error]) {
+            if(error && !*error)*error=cloudError(@"Could not retain the completed-save journal. Local progress is safe; retrying automatically.");
+            [self.journalLock unlock];return nil;
+        }
+        self.journaledDigest=save[@"digest"];
+    }
+    [self.journalLock unlock];return save;
+}
 - (void)committed:(NSDictionary *)save {
-    [self.snapshotLock lock];self.latest=save;[self.snapshotLock unlock];
-    // Persist the complete committed snapshot before returning to the game's Commit call.
-    NSError *error=nil;NSData *encoded=TOTKEncodeSave(save,&error);
-    if(![encoded writeToFile:[self.directory stringByAppendingPathComponent:@"last-committed.plist"] options:NSDataWritingAtomic error:&error])
-        fprintf(stderr,"[totk-cloud] snapshot backup failed; local game save retained: %s\n",error.localizedDescription.UTF8String);
+    // Serialize the local write and publication so an older retry cannot replace
+    // a newer journal. No CloudKit operation runs while journalLock is held.
+    [self.journalLock lock];NSError *error=nil;BOOL written=[self writeJournal:save error:&error];
+    self.journaledDigest=written?save[@"digest"]:nil;[self publish:save];[self.journalLock unlock];
+    if(!written)fprintf(stderr,"[totk-cloud] snapshot backup failed; local game save retained: %s\n",error.localizedDescription.UTF8String ?: "encoding failed");
     if(!self.database)return;
-    [self setMessage:@"Syncing with iCloud" detail:@"Uploading your completed save. Local progress is already saved."];
+    if(written)[self setMessage:@"Syncing with iCloud" detail:@"Uploading your completed save. Local progress is already saved."];
+    else [self setMessage:@"iCloud sync pending" detail:error.localizedDescription ?: @"Local progress is retained; the completed-save journal will retry."];
     [self checkForChanges];
 }
 @end

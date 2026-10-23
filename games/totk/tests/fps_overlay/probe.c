@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -30,6 +31,12 @@ static const char *const FPS60[7] = {
 
 static _Atomic int g_spin_stop;
 static void *spin_main(void *arg) { (void)arg; pthread_setname_np("probe-spin"); volatile unsigned long x = 0; while (!atomic_load(&g_spin_stop)) x++; return NULL; }
+/* Drawable completion handlers may run concurrently on presentation queues. */
+static void *display_main(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 2500; ++i) fps_overlay_note_displayed(500.0 + i / 120.0, i & 1);
+    return NULL;
+}
 
 static int pixel_is(int x, int y, const uint8_t want[4]) { return !memcmp(px + 4 * ((size_t)y * FPS_OVERLAY_TEX_W + x), want, 4); }
 
@@ -165,6 +172,35 @@ int main(void) {
     gt += 30.0;   /* off for 30 s, then on again */
     for (int i = 0; i < 60; i++) { fps_overlay_note_gen(++gk, gt); gt += 1.0 / 50; }
     CHECK(fps_overlay_gen_value() == 50, "after a gap: 50 per second, not an average over the gap (%d)", fps_overlay_gen_value());
+
+    /* Submitted tickets and generated work are not proof of a displayed picture. */
+    CHECK(fps_overlay_displayed_frames() == 0 && fps_overlay_generated_frames() == 0,
+          "submitted game/generated tickets must not enter actual displayed counters");
+    const double invalid_presented[] = {0.0, -1.0, NAN, INFINITY, -INFINITY};
+    for (size_t i = 0; i < sizeof invalid_presented / sizeof invalid_presented[0]; ++i) {
+        fps_overlay_note_displayed(invalid_presented[i], 0);
+        fps_overlay_note_displayed(invalid_presented[i], 1);
+    }
+    CHECK(fps_overlay_displayed_frames() == 0 && fps_overlay_generated_frames() == 0,
+          "invalid or failed drawable timestamps must not count as displayed frames");
+    fps_overlay_note_displayed(400.0, 0);
+    CHECK(fps_overlay_displayed_frames() == 1 && fps_overlay_generated_frames() == 0,
+          "native displayed picture increments total only");
+    fps_overlay_note_displayed(400.01, 1);
+    CHECK(fps_overlay_displayed_frames() == 2 && fps_overlay_generated_frames() == 1,
+          "generated displayed picture increments total and generated subset");
+    pthread_t displays[4]; int started = 0;
+    for (int i = 0; i < 4; ++i) {
+        int result = pthread_create(&displays[started], NULL, display_main, NULL);
+        CHECK(result == 0, "presentation worker starts (%d)", result);
+        if (!result) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(displays[i], NULL);
+    CHECK(fps_overlay_displayed_frames() == 2 + (uint64_t)started * 2500 &&
+          fps_overlay_generated_frames() == 1 + (uint64_t)started * 1250,
+          "concurrent presentation handlers preserve every displayed/generated frame");
+    CHECK(fps_overlay_value() == 60 && fps_overlay_gen_value() == 50,
+          "actual displayed counters leave legacy submitted/native meters unchanged");
 
     /* The bottom-right load line: text, its glyphs, the widest line within the wider texture at every scale, the busy-time
        union of in-order command buffers, and one real sample of this machine (cores split into P and E, GPU known). */

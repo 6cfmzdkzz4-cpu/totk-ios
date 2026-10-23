@@ -135,15 +135,24 @@ void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
 void runtime_rumble_set(unsigned side, float amp_low, float freq_low, float amp_high, float freq_high);   /* side 0 left, 1 right */
 int runtime_motion_read(RuntimeMotionState *out, int max);   /* newest first; 0 = no motion now */
 void runtime_motion_start(void);   /* the game (re)started its sensor: angle and direction start over */
+void runtime_motion_reset(void);   /* invalidate all history/reference; sampling IDs remain monotonic */
+void runtime_motion_stats(uint64_t *read_calls, uint64_t *states_returned);
 void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* runtime/motion_fusion.c */
 int runtime_motion_axes(const char *spec);   /* TOTK_GYRO_AXES ("-x,y,-z"): 1 set, 0 unset, -1 malformed */
 void runtime_motion_deadzone_default(double deg_s);   /* when TOTK_GYRO_DEADZONE is unset: 1.2 for HID motion, else 0 */
 void runtime_motion_live(int on);   /* a controller with motion attached (1) / detached (0) */
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 void runtime_feedback_focus(int active);   /* iOS: cancel output before suspension; rearm safely on return */
+void runtime_ios_settings_open(int open);   /* iOS: settings suspend gameplay independently of app foreground */
+void runtime_ios_foreground(int active);   /* iOS scene path shares the modal-settings focus gate */
 void runtime_gamepad_refresh(void);   /* main queue: refresh held controls after foregrounding */
+void runtime_device_motion_start(void);   /* iOS-only provider, independent of physical controller presence */
+void runtime_device_motion_focus(int active);
+void runtime_device_motion_orientation(int interface_orientation);
+uint64_t runtime_device_motion_sample_count(void);
 #ifdef __OBJC__
 @class GCController;
+void runtime_device_motion_controller(GCController *controller);
 void runtime_feedback_attach(GCController *controller);
 void runtime_feedback_detach(GCController *controller);
 #endif

@@ -14,7 +14,7 @@ spec.loader.exec_module(audit)
 
 class PublicationAuditTests(unittest.TestCase):
     def test_private_payload_and_generated_header_paths_are_rejected(self):
-        for name in ("game.nsp", "app/embedded.mobileprovision", "work/gameplay_extra_audio.h", "app/TOTK.app/Info.plist"):
+        for name in ("game.nsp", "app/embedded.mobileprovision", "work/gameplay_extra_audio.h", "app/TOTK.app/Info.plist", "work/totk_live_layouts.h", "work/totk-live-display-metadata.json"):
             with self.subTest(name=name):
                 self.assertTrue(audit.violations(name, b"synthetic"))
 
@@ -42,6 +42,18 @@ class PublicationAuditTests(unittest.TestCase):
             with patch.object(audit, "ROOT", root):
                 self.assertEqual(audit.audit_current()[1], [])
                 self.assertIn(("private.nsp", "forbidden payload/signing/output extension"), audit.audit_history()[1])
+
+    def test_index_audit_reads_staged_bytes_even_when_worktree_is_clean(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            source = root / "settings.txt"
+            source.write_bytes(b"ghp_" + b"A" * 36)
+            subprocess.run(["git", "-C", str(root), "add", "settings.txt"], check=True)
+            source.write_text("safe source")
+            with patch.object(audit, "ROOT", root):
+                self.assertEqual(audit.audit_current()[1], [])
+                self.assertEqual(audit.audit_staged()[1], [("settings.txt", "GitHub credential")])
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ from pathlib import Path
 from compile_seed import METAL_FLAGS
 from xcode_dir import developer_dir
 
+APP_FILENAME = 'Tears of the Kingdom.app'
+
 def run(args, cwd, log, env):
     log.parent.mkdir(parents=True,exist_ok=True)
     with log.open('w') as f:
@@ -48,17 +50,54 @@ def reusable_seed(seed, source_hash, metal_files):
     except (OSError,ValueError,KeyError,TypeError,AttributeError):
         return False
 
+def narrow_profile(version, display):
+    """Keep the verified narrow preparation separate from the wide-phone image."""
+    if display not in ('ipad','duo','iphone'):
+        raise RuntimeError('unknown display profile')
+    if display=='duo' and version!='v0':
+        raise RuntimeError('Duo supports only the verified base 1.0.0')
+    return version=='v0' and display in ('ipad','duo')
+
+
+def display_export_env(env, tree, modules, version, display):
+    """Export code only, with no inherited relay/audit or mismatched aspect."""
+    result=dict(env,TOTK_EXPORT_IOS=str(modules))
+    for key in ('TOTK_ASPECT','TOTK_IPAD_ASPECT_PATCH','TOTK_IPHONE_ASPECT_PATCH','TOTK_PCHTXT',
+                'TOTK_ASPECT_UI_PATCHED','TOTK_LIVE_DISPLAY','TOTK_LIVE_DISPLAY_AUDIT','DM_DUO_RELAY'):
+        result.pop(key,None)
+    if narrow_profile(version,display):
+        result.update(TOTK_OUTPUT_RES='2752x2064',TOTK_RENDER_RES='2752x2064',TOTK_LIVE_DISPLAY='1',
+                      TOTK_ASPECT='4:3',TOTK_IPAD_ASPECT_PATCH='1',TOTK_PCHTXT=str(tree/'build/ipad43.pchtxt'))
+    elif version=='v0':
+        result.update(TOTK_OUTPUT_RES='1920x1080',TOTK_RENDER_RES='1920x1080',TOTK_ASPECT='239:110',
+                      TOTK_IPHONE_ASPECT_PATCH='1',TOTK_PCHTXT=str(tree/'build/iphone239.pchtxt'))
+    return result
+
+
+def display_project(project, build_number, version, display):
+    """Bind bundle opt-in and compiler metadata gate to the same preparation."""
+    narrow=narrow_profile(version,display)
+    project=project.replace('CFBundleVersion: "18"', f'CFBundleVersion: "{build_number}"')
+    project=project.replace('TOTKDisplayAspect: "4:3"','TOTKDisplayAspect: "4:3"\n        TOTKLiveDisplayNarrow: '+('true' if narrow else 'false'))
+    project=project.replace('-I../build\n','-I../build -DTOTK_LIVE_DISPLAY_NARROW='+('1' if narrow else '0')+'\n')
+    if display=='iphone':
+        aspect='239:110' if version=='v0' else '16:9'
+        project=project.replace('TOTKOutputResolution: "2752x2064"','TOTKOutputResolution: "1920x1080"').replace('TOTKDisplayAspect: "4:3"',f'TOTKDisplayAspect: "{aspect}"')
+    return project
+
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--tree',type=Path,required=True);p.add_argument('--out',type=Path,required=True)
     p.add_argument('--version',choices=['v0','v112','v121','v143'],required=True);p.add_argument('--logs',type=Path,required=True)
     p.add_argument('--app-name',default='Tears of the Kingdom');p.add_argument('--bundle-id',default='org.macnativegames.totk')
     p.add_argument('--cloud-container', default='', help='optional private CloudKit container from your Apple team')
-    p.add_argument('--build-number', type=int, default=18)
+    p.add_argument('--build-number', type=int, default=27)
     p.add_argument('--app-only',action='store_true',help='prepare a device app bundle for direct signing and installation')
-    p.add_argument('--display',choices=['ipad','iphone'],default='ipad',help='signed display configuration; saves use the same iCloud identity')
+    p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: live narrow display; iphone: static wide display')
     a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
     if a.build_number < 1: raise RuntimeError('build number must be positive')
+    narrow=narrow_profile(a.version,a.display)
     if out.suffix.lower()!=('.app' if a.app_only else '.ipa'): raise RuntimeError('iOS output has the wrong extension')
     env=dict(os.environ,DEVELOPER_DIR=developer_dir())
     sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],env=env,text=True).strip()
@@ -70,21 +109,23 @@ def main():
     for name in ('runtime_tables.h','romfs_config.h'):
         clone(version_dir/name,gen/name)
     clone(tree/'build/shared_fonts_config.h',gen/'shared_fonts_config.h')
+    if narrow:
+        # Private generation is mandatory; a stale/absent metadata header must
+        # never produce an apparently live app with unprepared signed code.
+        for name in ('totk-live-display-metadata.json','totk_live_layouts.h'):
+            if not (tree/'build'/name).is_file(): raise RuntimeError(f'missing verified live display input: {name}')
+        clone(tree/'build/totk_live_layouts.h',gen/'totk_live_layouts.h')
+    else:
+        (gen/'totk_live_layouts.h').unlink(missing_ok=True)
     # Export the final code after all verified runtime patches have been applied, then embed it in executable segments.
     host=tree/('build/totk-native' if a.version=='v0' else f'build/totk-native-{a.version}')
     rewritten=tree/f'rewritten/{a.version}'; modules=gen/'modules';modules.mkdir(exist_ok=True)
     # Native iPad output must be patched into signed code on the Mac, never into executable pages on the device.
-    e=dict(env,TOTK_EXPORT_IOS=str(modules))
-    for key in ('TOTK_ASPECT','TOTK_IPAD_ASPECT_PATCH','TOTK_IPHONE_ASPECT_PATCH','TOTK_PCHTXT','TOTK_ASPECT_UI_PATCHED'):e.pop(key,None)
-    if a.version=='v0' and a.display=='ipad': e.update(TOTK_OUTPUT_RES='2752x2064',TOTK_RENDER_RES='2752x2064',
-                               TOTK_ASPECT='4:3',TOTK_IPAD_ASPECT_PATCH='1',TOTK_PCHTXT=str(tree/'build/ipad43.pchtxt'))
-    elif a.version=='v0':
-        e.update(TOTK_OUTPUT_RES='1920x1080',TOTK_RENDER_RES='1920x1080',TOTK_ASPECT='239:110',
-                 TOTK_IPHONE_ASPECT_PATCH='1',TOTK_PCHTXT=str(tree/'build/iphone239.pchtxt'))
+    e=display_export_env(env,tree,modules,a.version,a.display)
     run([host,rewritten,'export-ios'],tree,logs/'export-ios.log',e)
     flags=subprocess.check_output([sys.executable,ios/'tools/gen_embed.py',rewritten,gen/'embed.S','--text-dir',modules,'main','subsdk0','sdk'],text=True,env=env).strip()
     # The app's sources use version-specific patch and generated runtime tables.
-    project=(ios/'project.yml').read_text().replace('CFBundleVersion: "18"', f'CFBundleVersion: "{a.build_number}"')
+    project=display_project((ios/'project.yml').read_text(),a.build_number,a.version,a.display)
     # Default is memory-only. CloudKit is bound to the caller's own container.
     entitlements={'com.apple.developer.kernel.increased-memory-limit': True}
     if a.cloud_container:
@@ -98,8 +139,6 @@ def main():
     if a.cloud_container: project=project.replace('TOTKDisplayAspect: "4:3"','TOTKDisplayAspect: "4:3"\n        TOTKCloudContainer: '+a.cloud_container)
     settings=gen/'Settings.bundle';copy_tree(ios/'Settings.bundle',settings)
     if a.display=='iphone':
-        aspect='239:110' if a.version=='v0' else '16:9'
-        project=project.replace('TOTKOutputResolution: "2752x2064"','TOTKOutputResolution: "1920x1080"').replace('TOTKDisplayAspect: "4:3"',f'TOTKDisplayAspect: "{aspect}"')
         root=settings/'Root.plist';info=plistlib.loads(root.read_bytes())
         for row in info['PreferenceSpecifiers']:
             if row.get('Key')=='TOTKResolution':
@@ -141,7 +180,7 @@ def main():
     # Generate the app project with resolved identity and the embedded-segment linker flags.
     env.update(TOTK_APP_NAME=a.app_name,TOTK_BUNDLE_ID=a.bundle_id)
     xcconfig=gen/'totk.xcconfig'
-    frameworks=' '.join('-framework '+x for x in ['UIKit','Metal','MetalFX','Foundation','CloudKit','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','CoreHaptics','AVFAudio','Security'])
+    frameworks=' '.join('-framework '+x for x in ['UIKit','Metal','MetalFX','Foundation','CloudKit','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','CoreMotion','CoreHaptics','AVFAudio','Security'])
     xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a {flags}\n')
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
     derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
@@ -156,7 +195,7 @@ def main():
     romfs=tree/f'extracted/{a.version}/romfs'
     copy_tree(romfs,res/'romfs')
     patches=tree/f'extracted/{a.version}/romfs-patches'
-    if a.version=='v0': patches=tree/f'extracted/{a.version}'/('romfs-patches-43' if a.display=='ipad' else 'romfs-patches-iphone239')
+    if a.version=='v0': patches=tree/f'extracted/{a.version}'/('romfs-patches-43' if narrow else 'romfs-patches-iphone239')
     for src,dst in [(patches,res/'romfs-patches'),
                     (tree/f'extracted/{a.version}/romfs-patches-out',res/'romfs-patches-out'),
                     (tree/'extracted/firmware/shared-fonts',res/'shared-fonts')]: copy_tree(src,dst)
@@ -172,7 +211,7 @@ def main():
         print(f'Device app ready: {out}; sign and install directly with devicectl')
         return
     payload=tree/'build/ios-payload';shutil.rmtree(payload,ignore_errors=True);(payload/'Payload').mkdir(parents=True)
-    copy_tree(app,payload/'Payload/TOTK.app')
+    copy_tree(app,payload/'Payload'/APP_FILENAME)
     out.parent.mkdir(parents=True,exist_ok=True);out.unlink(missing_ok=True)
     run(['zip','-qry','-0',out,'Payload'],payload,logs/'ipa-zip.log',env)
     print(f'IPA ready: {out} ({out.stat().st_size/2**30:.1f} GiB); unsigned, sideload with your signing tool')

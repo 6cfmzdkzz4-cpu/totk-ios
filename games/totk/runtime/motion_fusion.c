@@ -25,6 +25,8 @@ enum { MOTION_RING = 64 };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static RuntimeMotionState ring[MOTION_RING];
 static uint64_t produced, last_ns, logged, log_at, reads_logged;
+static unsigned history_count;
+static uint64_t read_calls, states_returned;
 static double R[3][3];          /* controller -> reference; row i = reference axis i in controller coordinates */
 static double angle[3];
 static int restart = 1, live;
@@ -117,6 +119,7 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];   /* direction i = controller axis i in the reference frame */
     }
     produced++;
+    if (history_count < MOTION_RING) history_count++;
     if (!log_at) log_at = now;
     if (now - log_at >= 30000000000ull) {
         uint64_t values, reads; runtime_hid_feedback_stats(&values, &reads);
@@ -131,15 +134,26 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
     if (max <= 0) return 0;
     int n = 0;
     pthread_mutex_lock(&lock);
+    read_calls++;
     if (live && runtime_now_ns() - last_ns < 200000000ull) {   /* no sample for 200 ms: no motion */
-        uint64_t have = produced < MOTION_RING ? produced : MOTION_RING;
+        uint64_t have = history_count;
         n = (int)(have < (uint64_t)max ? have : (uint64_t)max);
         for (int i = 0; i < n; i++) out[i] = ring[(produced - 1 - (uint64_t)i) % MOTION_RING];
     }
+    states_returned += (uint64_t)n;
     pthread_mutex_unlock(&lock);
     return n;
 }
-void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
+void runtime_motion_reset(void) {
+    pthread_mutex_lock(&lock);
+    memset(ring, 0, sizeof ring); memset(R, 0, sizeof R); memset(angle, 0, sizeof angle);
+    history_count = 0; last_ns = 0; live = 0; restart = 1;
+    pthread_mutex_unlock(&lock);
+}
+void runtime_motion_start(void) { runtime_motion_reset(); }
+void runtime_motion_stats(uint64_t *reads, uint64_t *states) {
+    pthread_mutex_lock(&lock); *reads = read_calls; *states = states_returned; pthread_mutex_unlock(&lock);
+}
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
 void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
 void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }

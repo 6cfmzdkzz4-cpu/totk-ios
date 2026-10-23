@@ -31,6 +31,16 @@
 #include "nvn_dirty.h"
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
+#include "../../../../runtime/totk_live_display.h"
+#include "nvn_frame_geometry.h"
+extern TotkLiveSource runtime_live_display_finish_interval(uint64_t frame) __attribute__((weak_import));
+extern float runtime_aspect_now(void) __attribute__((weak_import));
+// Standalone graphics fixtures can keep the legacy static presenter. The real
+// renderer provides strong implementations carrying the entire bound interval.
+__attribute__((weak,noinline)) uint64_t mtl_present_source(const tex_t *texture,double period,const int crop[4],TotkLiveSource source) {
+    return totk_source_valid(source) && !source.paired ? mtl_present(texture,period,crop) : 0;
+}
+__attribute__((weak,noinline)) void mtl_present_bind_source(TotkLiveSource source) { (void)source; }
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -1853,7 +1863,7 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
 // TOTK_ASYNC_REPLAY=0 (default for now) runs everything on the calling thread as before.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; TotkLiveSource source; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -1868,7 +1878,7 @@ static int async_replay(void) {
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
-static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, TotkLiveSource source);
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate");
     for (;;) {
@@ -1883,7 +1893,7 @@ static void *x_thread(void *unused) {
             // worker threads preempt the replay (measured: replay 6.6 -> 13 ms, 10 fps). Half the period is declared.
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
-            present_exec(j.win, j.idx, j.period, j.crop, j.frame);
+            present_exec(j.win, j.idx, j.period, j.crop, j.frame, j.source);
         }
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
@@ -2547,16 +2557,24 @@ void dm_nvn_probe_present_interval(void) {
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 // The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
 // replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
-static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
+static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, TotkLiveSource source) {
     gfx_enter();
-    { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
-    if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
+    mtl_present_bind_source(source);
+    { void mtl_shot_at_present(const tex_t *t); if (totk_source_valid(source) && idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
+    if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present_source(CTX(o->tex[idx]), period, crop, source);   // 只入队，立即返回 | enqueue only, return immediately
     if (frame) mtl_set_frame(frame);
     gfx_leave();
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    // Capture the COMPLETED interval on its producer, exactly once. Replay can
+    // lag behind while the producer starts another camera/HUD generation.
+    TotkLiveSource source;
+    if(runtime_live_display_finish_interval) source=runtime_live_display_finish_interval(o->presents);
+    else { float aspect=runtime_aspect_now?runtime_aspect_now():0;
+        source=(TotkLiveSource){.frame=o->presents,.aspect=aspect>0?aspect:16.0/9,.valid=1,.fallback=1}; }
+
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (runtime_gameplay_feedback_tick) runtime_gameplay_feedback_tick(now_ns());
@@ -2581,12 +2599,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     uint64_t t0 = now_ns();
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
-        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
+        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9, .source=source};
         memcpy(j.crop, o->crop, sizeof j.crop);
         j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
-    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0, source);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);

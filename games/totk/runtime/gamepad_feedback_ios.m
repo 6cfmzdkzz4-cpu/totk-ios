@@ -15,6 +15,7 @@
 #include "gameplay_feedback.h"
 #include "gameplay_haptic_patterns.h"
 #include "skydive_feedback.h"
+#include "device_haptics_ios.h"
 
 static dispatch_queue_t feedbackQueue;
 static dispatch_source_t feedbackTimer;
@@ -30,8 +31,6 @@ static uint64_t playerSince[2], hapticLastActive[2], retryAt[2], generation[2], 
 static pthread_mutex_t sampleLock = PTHREAD_MUTEX_INITIALIZER;
 static TOTKFeedbackSample wanted[2];
 static uint64_t received[2], nonzero[2];
-static _Atomic uint64_t motionSamples;
-static _Atomic uint64_t motionEpoch;
 static uint64_t lastReport;
 static dispatch_queue_t diagnosticsQueue;
 static pthread_mutex_t reportLock = PTHREAD_MUTEX_INITIALIZER;
@@ -82,6 +81,7 @@ static void release_engine(int side) {
     playerSince[side]=hapticLastActive[side]=0;sentIntensity[side]=sentSharpness[side]=-1;
 }
 static void stop_output(void) {
+    runtime_device_haptics_quiet(runtime_now_ns());
     triggers_off();
     for(int side=0;side<2;side++)release_engine(side);
     pthread_mutex_lock(&sampleLock);
@@ -125,9 +125,10 @@ static void report(void) {
     pthread_mutex_unlock(&sampleLock);
     NSDictionary *info=@{
         @"connected":@(feedbackPad!=nil),@"foreground":@(foreground),
+        @"deviceHaptics":runtime_device_haptics_diagnostics(),
         @"stereoHapticsSupported":@(splitHandles),
         @"hapticsEnabled":@(handlesEnabled),@"adaptiveTriggersEnabled":@(triggersEnabled),
-        @"motionSamples":@(atomic_load(&motionSamples)),
+        @"motionSamples":@(runtime_device_motion_sample_count()),
         @"nativeValues":@[@(values[0]),@(values[1])],
         @"nativeNonzeroValues":@[@(positive[0]),@(positive[1])],
         @"hapticParameterCallsSucceeded":@[@(hapticUpdates[0]),@(hapticUpdates[1])],
@@ -313,6 +314,7 @@ static void feedback_tick(void) {
     pthread_mutex_lock(&sampleLock);memcpy(samples,wanted,sizeof samples);pthread_mutex_unlock(&sampleLock);
     TOTKSemanticContext context;TOTKSemanticEvents events;RuntimeGameplayFeedbackEvidence live;
     runtime_gameplay_feedback_read(&context,&events,&live);
+    BOOL compositionActive=foreground && (feedbackPad!=nil || runtime_device_haptics_wanted(foreground,feedbackPad!=nil));
     if(events.npc_interaction_timestamp_ns<semanticActiveSince)events.npc_interaction_timestamp_ns=0;
     if(events.landing_timestamp_ns<semanticActiveSince)events.landing_timestamp_ns=0;
     if(events.shield_block_timestamp_ns<semanticActiveSince)events.shield_block_timestamp_ns=0;
@@ -334,7 +336,7 @@ static void feedback_tick(void) {
     uint64_t now=runtime_now_ns();
     for(int side=0;side<2;side++){
         TOTKSemanticFeedbackOutput composed=totk_semantic_feedback_output(samples[side],context,events,now,
-            hapticGain,triggerGain,foreground && feedbackPad!=nil,&semanticState[side]);
+            hapticGain,triggerGain,compositionActive,&semanticState[side]);
         values[side]=(TOTKFeedbackOutput){.intensity=composed.handle_intensity,.sharpness=composed.handle_sharpness};
         TOTKHapticCueDescriptor descriptor={0};
         TOTKHapticCuePoint scaled[TOTK_HAPTIC_CUE_MAX_POINTS];
@@ -360,7 +362,7 @@ static void feedback_tick(void) {
         uint64_t admitted=cueState[side].active_sequence;
         TOTKHapticCueOutput extra=totk_haptic_cue_compose(values[side].intensity,values[side].sharpness,
             descriptor.cue_id?&descriptor:NULL,cue.event,gate,epoch,now,hapticGain,
-            foreground && feedbackPad!=nil,&cueState[side]);
+            compositionActive,&cueState[side]);
         if(cueState[side].active_sequence && cueState[side].active_sequence!=admitted)cueAdmissions[side]++;
         values[side].intensity=extra.intensity;values[side].sharpness=extra.sharpness;
         TOTKSkydiveFeedbackSample windSample={.timestamp_ns=context.timestamp_ns,
@@ -368,7 +370,7 @@ static void feedback_tick(void) {
             .descent_m=live.skydive_descent_m,.valid=context.valid,
             .paused=context.paused || live.controller_paused,.skydiving=live.skydiving};
         TOTKSkydiveFeedbackOutput wind=totk_skydive_feedback_compose(values[side].intensity,
-            values[side].sharpness,windSample,now,hapticGain,foreground && feedbackPad!=nil,(unsigned)side);
+            values[side].sharpness,windSample,now,hapticGain,compositionActive,(unsigned)side);
         values[side].intensity=wind.intensity;values[side].sharpness=wind.sharpness;
         skydiveWindActive[side]=wind.wind_active;
         if(wind.wind_active)skydiveWindTicks[side]++;
@@ -378,6 +380,10 @@ static void feedback_tick(void) {
         if(side && triggersEnabled && dual_sense() && composed.context_fresh && context.bow_ready &&
            !context.bow_drawn && submittedTrigger[1].mode==TOTK_TRIGGER_SLOPE)bowPrearmPolicyTicks++;
     }
+    /* One authoritative composition fans out to independent sinks. The local
+       sink is silent with a controller unless Always was explicitly selected. */
+    runtime_device_haptics_submit(values[0],values[1],context.timestamp_ns,now,
+        foreground,feedbackPad!=nil,context.paused && !context.npc_interaction_allowed);
     if(splitHandles){handle_output(0,values[0],now);handle_output(1,values[1],now);}
     else{
         // A controller with one actuator receives the stronger channel once, rather than two competing default engines.
@@ -398,6 +404,7 @@ static void feedback_start(void) {
             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INTERACTIVE,0));
         diagnosticsQueue=dispatch_queue_create("org.macnativegames.totk.controller-diagnostics",
             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
+        runtime_device_haptics_initialize(feedbackQueue);
         dispatch_queue_set_specific(feedbackQueue,&queueKey,&queueKey,NULL);
         feedbackTimer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,feedbackQueue);
         dispatch_source_set_timer(feedbackTimer,DISPATCH_TIME_FOREVER,8*NSEC_PER_MSEC,NSEC_PER_MSEC);
@@ -406,43 +413,20 @@ static void feedback_start(void) {
         for(int side=0;side<2;side++){sentIntensity[side]=sentSharpness[side]=-1;sentTriggerFrequency[side]=-1;}
     });
 }
-static void motion_off(GCController *controller) {
-    atomic_fetch_add(&motionEpoch,1);
-    GCMotion *motion=controller.motion;
-    motion.valueChangedHandler=nil;
-    if(motion.sensorsRequireManualActivation)motion.sensorsActive=NO;
-    runtime_motion_live(0);
-}
-static void motion_on(GCController *controller) {
-    if(!runtime_gyro_enabled() || !controller.motion.hasRotationRate)return;
-    GCMotion *motion=controller.motion;
-    uint64_t token=atomic_fetch_add(&motionEpoch,1)+1;
-    runtime_motion_deadzone_default(0.35);
-    if(motion.sensorsRequireManualActivation)motion.sensorsActive=YES;
-    motion.valueChangedHandler=^(GCMotion *value){
-        if(atomic_load(&motionEpoch)!=token)return;
-        GCAcceleration a=value.acceleration;
-        if(value.hasGravityAndUserAcceleration){
-            a.x=value.gravity.x+value.userAcceleration.x;
-            a.y=value.gravity.y+value.userAcceleration.y;
-            a.z=value.gravity.z+value.userAcceleration.z;
-        }
-        double acceleration[3]={a.x,a.y,a.z};
-        double rotation[3]={value.rotationRate.x,value.rotationRate.y,value.rotationRate.z};
-        if(!isfinite(a.x)||!isfinite(a.y)||!isfinite(a.z)||
-           !isfinite(rotation[0])||!isfinite(rotation[1])||!isfinite(rotation[2]))return;
-        if(!a.x&&!a.y&&!a.z&&!rotation[0]&&!rotation[1]&&!rotation[2])return;
-        runtime_motion_feed(acceleration,rotation,runtime_now_ns());
-        atomic_fetch_add(&motionSamples,1);
-    };
+static void refresh_feedback_activity(void) {
+    BOOL local=runtime_device_haptics_wanted(foreground,feedbackPad!=nil);
+    runtime_gameplay_feedback_set_active(foreground &&
+        ((feedbackPad!=nil && (handlesEnabled || triggersEnabled)) || local));
+    BOOL ticking=foreground && (feedbackPad!=nil || local);
+    dispatch_source_set_timer(feedbackTimer,ticking?dispatch_time(DISPATCH_TIME_NOW,0):DISPATCH_TIME_FOREVER,
+        8*NSEC_PER_MSEC,NSEC_PER_MSEC);
 }
 void runtime_feedback_attach(GCController *controller) {
     feedback_start();
     on_feedback_queue(^{
         if(feedbackPad==controller)return;
-        motion_off(feedbackPad);stop_output();feedbackPad=controller;triggers_off();
+        stop_output();feedbackPad=controller;triggers_off();
         semanticActiveSince=runtime_now_ns();
-        runtime_motion_start();atomic_store(&motionSamples,0);
         memset(hapticUpdates,0,sizeof hapticUpdates);memset(hapticStarts,0,sizeof hapticStarts);
         memset(triggerUpdates,0,sizeof triggerUpdates);
         memset(cueAdmissions,0,sizeof cueAdmissions);
@@ -455,11 +439,7 @@ void runtime_feedback_attach(GCController *controller) {
         NSSet *where=controller.haptics.supportedLocalities;
         splitHandles=[where containsObject:GCHapticsLocalityLeftHandle] && [where containsObject:GCHapticsLocalityRightHandle];
         for(int side=0;side<2;side++)retryAt[side]=0;
-        if(foreground){
-            motion_on(controller);
-            dispatch_source_set_timer(feedbackTimer,dispatch_time(DISPATCH_TIME_NOW,0),8*NSEC_PER_MSEC,NSEC_PER_MSEC);
-        }
-        runtime_gameplay_feedback_set_active(foreground && (handlesEnabled || triggersEnabled));
+        refresh_feedback_activity();
         fprintf(stderr,"[controller-feedback] attached %s (%s): stereo-supported=%d adaptive-supported=%d adaptive-enabled=%d motion-supported=%d\n",
             controller.vendorName.UTF8String?:"controller",controller.productCategory.UTF8String?:"unknown",
             splitHandles,dual_sense()!=nil,triggersEnabled,controller.motion.hasRotationRate);
@@ -470,9 +450,9 @@ void runtime_feedback_detach(GCController *controller) {
     if(!feedbackQueue)return;
     on_feedback_queue(^{
         if(feedbackPad!=controller)return;
-        runtime_gameplay_feedback_set_active(0);
-        motion_off(controller);stop_output();feedbackPad=nil;splitHandles=NO;
-        dispatch_source_set_timer(feedbackTimer,DISPATCH_TIME_FOREVER,8*NSEC_PER_MSEC,NSEC_PER_MSEC);
+        stop_output();feedbackPad=nil;splitHandles=NO;
+        semanticActiveSince=runtime_now_ns();
+        refresh_feedback_activity();
         report();
     });
 }
@@ -481,20 +461,13 @@ void runtime_feedback_quiet(void) {
     if(feedbackQueue)on_feedback_queue(^{stop_output();});
 }
 void runtime_feedback_focus(int active) {
-    if(!feedbackQueue)return;
+    feedback_start();
     on_feedback_queue(^{
-        if(foreground==(active!=0))return;
         foreground=active!=0;
-        runtime_gameplay_feedback_set_active(foreground && feedbackPad!=nil && (handlesEnabled || triggersEnabled));
-        if(!foreground){
-            motion_off(feedbackPad);stop_output();
-            dispatch_source_set_timer(feedbackTimer,DISPATCH_TIME_FOREVER,8*NSEC_PER_MSEC,NSEC_PER_MSEC);
-        }else if(feedbackPad){
-            stop_output();
-            semanticActiveSince=runtime_now_ns();
-            motion_on(feedbackPad);
-            dispatch_source_set_timer(feedbackTimer,dispatch_time(DISPATCH_TIME_NOW,0),8*NSEC_PER_MSEC,NSEC_PER_MSEC);
-        }
+        stop_output();
+        runtime_device_haptics_preferences();
+        semanticActiveSince=runtime_now_ns();
+        refresh_feedback_activity();
         report();
     });
 }

@@ -1,6 +1,7 @@
 // TOTK: MetalFX frame interpolation (not in D2R). See totk_mfx.m.
 #pragma once
 #import <Metal/Metal.h>
+#include "nvn_frame_geometry.h"
 
 /* Frame interpolation modes (user, 2026-10-16 night: key 2 cycles off -> 30+30 -> 50+50 -> uncapped -> off):
    MFX_30   the game renders 30 frames a second, MetalFX makes the frame between ("30+30");
@@ -26,12 +27,14 @@ id<MTLResidencySet> mfx_residency(void);   // our textures; the queue adds it on
 // between the previous and this frame, or -1 (first frame, missing input, scene cut; state already advanced). frame_s:
 // the pacing period (two display refreshes; 0 in unpaced measurement runs). encode: motion vectors and the interpolation into cb (Metal 4, own command buffer, GPU order after this
 // frame). abort: a prepared frame that cannot be encoded (no free command buffer); drops the history.
-int mfx_frame_prepare(double frame_s);
+int mfx_frame_prepare(double frame_s,TotkLiveSource source);
 // Keep the returned resources alive until this command buffer's GPU completion.
 // Cached interpolators drop their public texture bindings after encoding.
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp);   // heap: timestamps at stamp / stamp+1 around MetalFX (may be nil)
 void mfx_note_gpu(double ms);   // GPU time of one interpolation, for the statistics line
 void mfx_frame_abort(void);
+void mfx_geometry_reset(void); // frame worker only: next valid pair starts fresh
+TotkLiveSource mfx_output_source(int slot);
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);
 void mfx_mv_log(void);

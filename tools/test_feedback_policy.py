@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--generated-dir', type=Path, help='private verified build folder for observer/table tests')
     args = parser.parse_args()
-    tests = ['test_dualsense_feedback', 'test_haptic_cues', 'test_skydive_feedback']
+    tests = ['test_dualsense_feedback', 'test_haptic_cues', 'test_skydive_feedback', 'test_motion_sources', 'test_device_haptics', 'test_touch_controls', 'test_feedback_transport']
     if args.generated_dir:
         tests += ['test_gameplay_feedback', 'test_haptic_generated']
     with tempfile.TemporaryDirectory(prefix='totk-policy-tests-') as folder:
@@ -23,6 +23,10 @@ def main():
                        '-I'+str(ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/include')]
             if args.generated_dir:
                 command += ['-I'+str(args.generated_dir.resolve())]
+            if name == 'test_motion_sources':
+                command += [str(ROOT/'games/totk/runtime/motion_fusion.c')]
+            if name == 'test_feedback_transport':
+                command += [str(ROOT/'games/totk/runtime/hid_feedback.c')]
             exe = Path(folder)/name
             command += [str(ROOT/'games/totk/tests'/f'{name}.c'), '-o', str(exe)]
             subprocess.run(command, check=True)

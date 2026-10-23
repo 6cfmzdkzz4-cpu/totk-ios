@@ -456,6 +456,8 @@ static void patch_ios_aspect(Module *m) {
 #endif
 }
 
+#include "totk_live_display.h"
+
 void runtime_game_patches(Module *m) {
     runtime_survey_init(m);
     const size_t n = sizeof fps60_sites / sizeof fps60_sites[0];
@@ -467,6 +469,7 @@ void runtime_game_patches(Module *m) {
         patch_render_res(m);
         patch_output_res(m);
         patch_ios_aspect(m);
+        runtime_live_display_install(m);
         for (size_t i = 0; i < n; i++) {
             uint32_t word;
             memcpy(&word, m->base + fps60_sites[i].offset, sizeof word);
@@ -485,6 +488,7 @@ void runtime_game_patches(Module *m) {
     patch_render_res(m);
     patch_output_res(m);
     patch_ios_aspect(m);
+    runtime_live_display_install(m);
     patch_trap(m);
 #if defined(TOTK_GAME_V121)
     { static const uint64_t sites[] = {0xcb4b10, 0x12521cc, 0x19b36f0, 0x1ecdf68};   /* camera x2, viewport x2 (aspect_patch.h) */

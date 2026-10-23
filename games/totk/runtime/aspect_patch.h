@@ -18,10 +18,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define ASPECT_DATA_SLOT 56   /* the ratio's float on the data page after main; 0.0 = the game's own */
 
-static _Atomic(uint32_t) *g_aspect_slot;   /* points into that page once the stubs are in */
+static _Atomic uintptr_t g_aspect_slot_address; /* publish the initialized aligned pair to host threads */
 static float g_aspect_wide;               /* the ratio key 4 switches to */
 
 /* TOTK_ASPECT as a ratio; 0 when unset or "0". A malformed value stops the start. */
@@ -37,15 +38,31 @@ static inline float aspect_requested(void) {
 
 /* The ratio in force (0 = the game's own 16:9): nvn_mtl.m stretches the picture over the window while it is set. */
 float runtime_aspect_now(void) {
-    if (!g_aspect_slot) return 0;
-    uint32_t bits = atomic_load(g_aspect_slot); float v; memcpy(&v, &bits, 4); return v;
+    uintptr_t address=atomic_load_explicit(&g_aspect_slot_address,memory_order_acquire);
+    if(!address)return 0;
+    uint64_t pair=atomic_load_explicit((_Atomic uint64_t *)address,memory_order_acquire);
+    uint32_t bits=(uint32_t)pair;float v;memcpy(&v,&bits,4);return v;
+}
+
+/* A guest frame boundary publishes camera and UI viewport lanes together.
+   Guest camera/viewport veneers load the corresponding aligned 32-bit lane. */
+void runtime_aspect_publish_live(float aspect,float viewport_scale) {
+    uintptr_t address=atomic_load_explicit(&g_aspect_slot_address,memory_order_acquire);
+    if(!address || !isfinite(aspect) || !isfinite(viewport_scale) || aspect<.5f || aspect>16.0f/9.0f || viewport_scale<=0)
+        runtime_fail("live display: invalid camera/viewport publication");
+    uint32_t camera,ui;memcpy(&camera,&aspect,4);memcpy(&ui,&viewport_scale,4);
+    atomic_store_explicit((_Atomic uint64_t *)address,(uint64_t)camera|((uint64_t)ui<<32),memory_order_release);
 }
 
 /* Key 4 (runtime/input.c). Returns 0 where it is not available (iPhone / iPad, other game versions). */
 int runtime_aspect_toggle(void) {
-    if (!g_aspect_slot) return 0;
-    float next = runtime_aspect_now() ? 0 : g_aspect_wide; uint32_t bits; memcpy(&bits, &next, 4);
-    atomic_store(g_aspect_slot, bits);
+    extern int runtime_live_display_enabled(void) __attribute__((weak_import));
+    if(runtime_live_display_enabled && runtime_live_display_enabled())return 1;
+    uintptr_t address=atomic_load_explicit(&g_aspect_slot_address,memory_order_acquire);
+    if(!address)return 0;
+    float next=runtime_aspect_now()?0:g_aspect_wide;uint32_t bits;memcpy(&bits,&next,4);
+    uint64_t previous=atomic_load_explicit((_Atomic uint64_t *)address,memory_order_relaxed);
+    atomic_store_explicit((_Atomic uint64_t *)address,(previous&UINT64_C(0xffffffff00000000))|bits,memory_order_release);
     fprintf(stderr, "[totk] key 4: aspect ratio %s\n", next ? "wide" : "16:9 (the game's own)");
     if (next) fprintf(stderr, "[totk] aspect ratio %.4f\n", next);
     return 1;
@@ -67,7 +84,7 @@ static inline void aspect_install(Module *m, const char *version, const uint64_t
     g_aspect_wide = start ? start : 21.0f / 9.0f;
     uint64_t page_end = (m->text_end + 0x3fff) & ~0x3fffULL;
     if (stub_off < m->text_end || stub_off + ASPECT_STUB * nsite > page_end) runtime_fail("aspect patch: no room in main's text padding");
-    if (data_off + ASPECT_DATA_SLOT + 4 > m->size) runtime_fail("aspect patch: no data page after main");
+    if (data_off + ASPECT_DATA_SLOT + 8 > m->size) runtime_fail("aspect patch: no data page after main");
     if (!TARGET_OS_IPHONE)
         for (unsigned i = 0; i < ASPECT_STUB * nsite; i++) if (m->base[stub_off + i]) runtime_fail("aspect patch: text padding in use");
     for (unsigned i = 0; i < nsite; i++) {
@@ -96,9 +113,10 @@ static inline void aspect_install(Module *m, const char *version, const uint64_t
             memcpy(m->base + sites[i], &jump, 4);
         }
     }
-    g_aspect_slot = (_Atomic(uint32_t) *)(void *)(m->base + data_off + ASPECT_DATA_SLOT);
-    uint32_t bits = 0; if (start) memcpy(&bits, &start, 4);
-    atomic_store(g_aspect_slot, bits);
+    _Atomic uint64_t *slot=(_Atomic uint64_t *)(void *)(m->base+data_off+ASPECT_DATA_SLOT);
+    uint32_t bits=0,ui_bits;float unit=1;memcpy(&ui_bits,&unit,4);if(start)memcpy(&bits,&start,4);
+    atomic_store_explicit(slot,(uint64_t)bits|((uint64_t)ui_bits<<32),memory_order_release);
+    atomic_store_explicit(&g_aspect_slot_address,(uintptr_t)slot,memory_order_release);
     fprintf(stderr, "[totk] %s ultrawide: key 4 switches 16:9 / %.4f (TOTK_ASPECT), starts %s; %u camera site(s), stubs +%#llx\n",
             version, g_aspect_wide, start ? "wide" : "at 16:9", nsite, (unsigned long long)stub_off);
 }

@@ -1,5 +1,9 @@
 /* Native keyboard and macOS gamepad backed full-key controller. State ABI follows libnx HID. */
 #include "runtime.h"
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#include "totk_duo_scene.h"
 #include "autoload.h"
 #include "world_survey.h"
 #include <stdbool.h>
@@ -60,6 +64,11 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
  RuntimeGamepadState pad;runtime_gamepad_read(&pad);state.buttons|=pad.buttons;
+#if !TARGET_OS_IPHONE
+ RuntimeGamepadState relay;totk_duo_scene_read(&relay);state.buttons|=relay.buttons;
+ if(abs(relay.lx)>abs(state.lx))state.lx=relay.lx;if(abs(relay.ly)>abs(state.ly))state.ly=relay.ly;
+ if(abs(relay.rx)>abs(state.rx))state.rx=relay.rx;if(abs(relay.ry)>abs(state.ry))state.ry=relay.ry;
+#endif
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;

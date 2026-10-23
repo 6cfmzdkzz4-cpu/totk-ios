@@ -61,6 +61,7 @@ static struct {
  * fix every source of long-session memory growth. Diagnostic opt-out below. */
 #define MFX_FI_CACHE 4
 static id<MTL4FXFrameInterpolator> g_fi_cache[MFX_FI_CACHE];
+static TotkLiveSource g_mfx_previous_source,g_mfx_output_source[MFX_OUT];
 static unsigned g_fi_cache_count;
 static int fi_cache_on(void) {
     static int on = -1;
@@ -233,7 +234,11 @@ static int camera_cut(void) {
     return sqrt(dx * dx + dy * dy + dz * dz) > 8.0 || f < cos(25.0 * M_PI / 180.0);
 }
 
-int mfx_frame_prepare(double frame_s) {
+int mfx_frame_prepare(double frame_s,TotkLiveSource source) {
+    // Same raster dimensions can carry another camera, inset or HUD epoch.
+    if(!totk_source_valid(source) || !totk_source_geometry_equal(source,g_mfx_previous_source))mfx_geometry_reset();
+    g_mfx_previous_source=source;
+    if(!totk_source_valid(source)){g.scene_ok=g.cam_ok=0;g.depth=nil;return -1;}
     g.frames++;
     id<MTLTexture> depth = g.depth;
     int ok = g.scene_ok && g.cam_ok && depth && g.ui;
@@ -257,12 +262,15 @@ int mfx_frame_prepare(double frame_s) {
     if (!inv4(vc, ic)) { g.skip_input++; g.prev_ok = g.hist_ok = 0; return -1; }
     mul4(vp, ic, m);
     int s = g.slot = (g.slot + 1) % MFX_OUT;
+    g_mfx_output_source[s]=source;
     float *par = g.mv_par[s].contents;
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
     par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
     g.enc_depth = depth;
     return s;
 }
+void mfx_geometry_reset(void) { g.enc_depth=nil;g.prev_ok=g.hist_ok=0;g.last_prepare_s=0; }
+TotkLiveSource mfx_output_source(int slot) { return slot>=0 && slot<MFX_OUT ? g_mfx_output_source[slot] : (TotkLiveSource){0}; }
 void mfx_frame_abort(void) { g.enc_depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> heap, NSUInteger stamp) {
     id<MTLTexture> depth = g.enc_depth; g.enc_depth = nil; g.last_depth = depth; g.last_slot = s;

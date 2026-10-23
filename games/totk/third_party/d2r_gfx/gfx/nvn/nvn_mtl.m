@@ -23,6 +23,12 @@
 #include "../tex/nvn_deswizzle_gpu.h"
 #include "totk_shader_rt.h"
 #include "totk_mfx.h"
+#include "../../../../runtime/totk_duo_capture.h"
+extern void totk_duo_capture_pixels(const void *,size_t,size_t,size_t,int,TotkLiveSource) __attribute__((weak_import));
+#include "../../../../runtime/totk_scene_geometry.h"
+static totk_geometry_epoch g_present_geometry;
+/* UIKit never enters the queue mutex, Metal or MetalFX here. */
+void mtl_present_geometry_changed(void) { totk_geometry_changed(&g_present_geometry); }
 #include "totk_mfx_up.h"
 #include "totk_sysload.h"
 /* TOTK_MFX_UPSCALE: for the one compose draw that samples the smaller scene, the scene texture and its MetalFX upscale
@@ -158,6 +164,7 @@ static int nogpu(void) {
 static void gpu_budget_check(const char *where);
 static void dead_put_flush(void);
 static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp);
+static _Thread_local TotkLiveSource g_present_source_interval;
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]);
 static void treg_stale_report(void);
 static void treg_drop_serial(uint64_t serial);
@@ -4189,6 +4196,7 @@ static int mfx_ui_vs(const char *key) {
    that scene (squeezed, Link turns into a black silhouette). The canvas is learned as for TOTK_MFX (canvas_learn,
    uw_note_present); g_uw_ui: this frame's UI has begun. */
 extern float runtime_aspect_now(void) __attribute__((weak_import));
+extern int runtime_live_display_enabled(void) __attribute__((weak_import));
 static int g_uw_ui;
 _Atomic long g_uw_log;   // diagnostic "flag uw_log <frames>": log the canvas draws of that many frames
 static double uw_ratio(void) { float a = runtime_aspect_now ? runtime_aspect_now() : 0; return a > 0 ? a : 0; }
@@ -10597,8 +10605,8 @@ void mtl_res_counts(uint32_t tick, const char *why) {
 #define SHOTQ_MAX 64
 static struct { uint64_t frame; char path[1024]; } g_shotq[SHOTQ_MAX]; static int g_nshotq;
 static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
-static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int fps_overlay);
-static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i);
+static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int fps_overlay, TotkLiveSource source_interval);
+static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i, TotkLiveSource source_interval);
 // 整窗截图要的游戏画面（前端 window_shot，不再对挂着显示节拍的 Metal 图层做 drawViewHierarchy）：下一次上屏时，出图线程把同一帧
 // 按上屏同一套编码（present_encode）画进一张与交换链同尺寸的离屏贴图，GPU 做完后在完成回调里交出 CGImage（回调不阻塞上屏）。g_shotq_mu 护
 // Game picture needed by the whole-window screenshot (front end window_shot; no longer does drawViewHierarchy on a Metal layer with the display link attached): at the next present, the present thread draws the same frame
@@ -10607,14 +10615,14 @@ static void (^g_grab_cb)(CGImageRef img);
 void mtl_grab_next_present(void (^cb)(CGImageRef img)) { pthread_mutex_lock(&g_shotq_mu); g_grab_cb = [cb copy]; pthread_mutex_unlock(&g_shotq_mu); }
 /* The window picture re-rendered offscreen by the legacy encoder: only for presents that draw no drawable
    (TOTK_PRESENT_SKIP measurement runs); a real present copies its drawable (present_now). */
-static void grab_present(void (^cb)(CGImageRef), id<MTLTexture> src, const int crop[4], CGSize sz) {
+static void grab_present(void (^cb)(CGImageRef), id<MTLTexture> src, const int crop[4], CGSize sz, TotkLiveSource source_interval) {
     if (!cb) return;
     size_t w = (size_t)sz.width, h = (size_t)sz.height, row = w * 4;
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
     d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
     id<MTLTexture> out = w && h ? [g_dev newTextureWithDescriptor:d] : nil; id<MTLBuffer> buf = out ? [g_dev newBufferWithLength:row * h options:MTLResourceStorageModeShared] : nil;
     id<MTLCommandBuffer> cb2 = buf ? q_cb() : nil;
-    if (!cb2 || !present_encode(cb2, src, out, crop, 1)) { MLOG("【红】整窗截图：游戏画面离屏编码失败（%zux%zu）", w, h); cb(NULL); return; }
+    if (!cb2 || !present_encode(cb2, src, out, crop, 1, source_interval)) { MLOG("【红】整窗截图：游戏画面离屏编码失败（%zux%zu）", w, h); cb(NULL); return; }
     id<MTLBlitCommandEncoder> b = [cb2 blitCommandEncoder];
     [b copyFromTexture:out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
     [b endEncoding];
@@ -10710,7 +10718,7 @@ static void shot_body(id<MTLTexture> src, const char *path, int screen, const in
         id<MTLTexture> out = [g_dev newTextureWithDescriptor:d];
         if (!out) { MLOG("【红】截图输出贴图建不出 %dx%d", out_w, out_h); return; }
         id<MTLCommandBuffer> cb = q_cb();
-        if (!present_encode(cb, src, out, crop, 0)) return;
+        if (!present_encode(cb, src, out, crop, 0, g_present_source_interval)) return;
         cb_commit(cb); cb_wait(cb);
         read = out;
     }
@@ -11034,6 +11042,11 @@ static void present_pipeline(MTLPixelFormat format) {
 // TOTK: FPS and on-screen picture size in the top-right corner of the game picture (pixels come from fps_overlay.c). Rasterises into
 // the slot's texture only when what is shown changes, and returns the viewport and source rectangle to draw.
 static int fps_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, float uv[8]) {
+#if TARGET_OS_IPHONE
+    /* UIKit owns the small interactive counter; other GPU HUD layers remain intact. */
+    (void)slot; (void)vp; (void)ovp; (void)uv;
+    return 0;
+#else
     if (!fps_overlay_hints_enabled() || !fps_overlay_enabled() || slot < 0 || slot > 3 || !g_fps_tex[slot]) return 0;
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     static uint8_t px[FPS_OVERLAY_TEX_W * FPS_OVERLAY_TEX_H * 4];
@@ -11055,6 +11068,7 @@ static int fps_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, float
     const float u[8] = {0, 0, bw / W, bh / H, 0.5f / W, 0.5f / H, (bw - 0.5f) / W, (bh - 0.5f) / H};
     memcpy(uv, u, sizeof u);
     return 1;
+#endif
 }
 /* TOTK automatic shader collection, bottom-left box (user, 2026-10-16 night: "is anything new being found and collected"):
    "SHADER +<variants new to the translation cache this run>/<variants in the cache> PSO +<pipelines added to the warm
@@ -11158,12 +11172,27 @@ static void outup_note_gpu(int slot) {   // the present command buffer of this s
 }
 // TOTK_STRETCH=1, or the ultrawide ratio of key 4 / TOTK_ASPECT: fill the window whatever its shape, like an emulator's "Stretch to Window" (aspect-ratio mods such as
 // TOTK-Ultrawide draw a horizontally squeezed picture for it). Off: the game picture keeps its shape, centred.
+#if !TARGET_OS_IPHONE
 static int present_stretch(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_STRETCH"); on = e && !strcmp(e, "1"); }
-    return on || (runtime_aspect_now && runtime_aspect_now() > 0);   // key 4 / TOTK_ASPECT: runtime/aspect_patch.h
+    return on;   // key 4 / TOTK_ASPECT: runtime/aspect_patch.h
 }
-static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int fps_overlay) {
+#endif
+static MTLViewport present_viewport(double dw,double dh,double cw,double ch,TotkLiveSource source_interval) {
+    if(!totk_source_valid(source_interval) || !isfinite(dw) || !isfinite(dh) || !isfinite(cw) || !isfinite(ch) ||
+       dw<=0 || dh<=0 || cw<=0 || ch<=0)return (MTLViewport){0};
+    dm_display_geometry geometry=dm_display_make(dw,dh,1,source_interval.aspect);
+    if(!geometry.valid)return (MTLViewport){0};
+    dm_display_rect r=geometry.picture;
+    MTLViewport vp={r.x,r.y,r.width,r.height,0,1};
+    if(fabs((dw/dh)/source_interval.aspect-1)<0.01)vp=(MTLViewport){0,0,dw,dh,0,1};
+#if TARGET_OS_OSX
+    if(!source_interval.paired && present_stretch())vp=(MTLViewport){0,0,dw,dh,0,1};
+#endif
+    return vp;
+}
+static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int fps_overlay, TotkLiveSource source_interval) {
     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
     if (crop && (crop[2] || crop[3])) {
         if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
@@ -11182,9 +11211,9 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     // 比例差 < 1%（全屏口径下游戏宽度取 8 的倍数带来的零头，如 1952x900 对 2868x1320 差 0.17%）直接铺满，不留几像素的边
     // Keep the game picture's aspect ratio and center it, leaving black bars in the rest (no stretching when the screen ratio differs from the game's, e.g. iPhone about 19.5:9 versus the game's 16:9);
     // when the ratio difference is < 1% (the remainder from the game width being a multiple of 8 in the full-screen setup, e.g. 1952x900 versus 2868x1320 differs by 0.17%) fill directly, leaving no few-pixel border
-    double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
-    MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
-    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01 || present_stretch()) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
+    double dw=dst.width,dh=dst.height;
+    MTLViewport vp=present_viewport(dw,dh,cw,ch,source_interval);
+    if(!(vp.width>0 && vp.height>0))return 0;
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     static double last_vp[4];   // 视口变化时记一行（真机屏幕级验收 screen_check.py 核宽高比用） | Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
@@ -11215,7 +11244,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     [en endEncoding];
     return 1;
 }
-static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i) {
+static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i, TotkLiveSource source_interval) {
     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
     if (crop && (crop[2] || crop[3])) {
         if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
@@ -11226,9 +11255,9 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     }
     if (crop) atomic_store(&g_pic_big, cw > 1920 || ch > 1080);   // a game frame (interpolated frames come without the crop)
     present_pipeline(dst.pixelFormat);
-    double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
-    MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
-    if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01 || present_stretch()) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
+    double dw=dst.width,dh=dst.height;
+    MTLViewport vp=present_viewport(dw,dh,cw,ch,source_interval);
+    if(!(vp.width>0 && vp.height>0))return 0;
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     id<MTLTexture> up = output_upscale(cb, src, cx, cy, cw, ch, vp, uv_i);   // TOTK 2K output: MetalFX to the viewport, drawn 1:1 below
     id<MTLTexture> pic = up ? up : src;
@@ -11461,7 +11490,12 @@ static void cadence_note(double tt, int interp) {
     }
     pthread_mutex_unlock(&mu);
 }
-static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, int interp) {
+static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, int interp, uint64_t geometry_epoch, TotkLiveSource source_interval) {
+    if(!totk_source_valid(source_interval))return 0;
+    g_present_source_interval=source_interval;
+    if(interp>=0 && (!totk_geometry_generated_current(&g_present_geometry,geometry_epoch) ||
+        !totk_source_geometry_equal(mfx_output_source(interp),source_interval) ||
+        mfx_output_source(interp).frame!=source_interval.frame))return 0;
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
     /* TOTK: the FPS box counts game presents per second and, while MetalFX interpolates, the generated frames shown as
@@ -11653,7 +11687,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     /* TOTK_PRESENT_SKIP=1 (measurement only): never take a drawable, so the render pipeline's own frame rate shows (the window
        does not update). */
     static int present_skip = -1; if (present_skip < 0) { present_skip = getenv("TOTK_PRESENT_SKIP") != NULL; if (present_skip) MLOG("【实验】TOTK_PRESENT_SKIP=1：不出图，只测渲染流水线"); }
-    if (nogpu() || present_skip) { if (grab && present_skip && !nogpu()) grab_present(grab, src, crop, layer.drawableSize);
+    if (nogpu() || present_skip) { if (grab && present_skip && !nogpu()) grab_present(grab, src, crop, layer.drawableSize, source_interval);
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu); return 1; }
     uint64_t dt0 = now_ns();
     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
@@ -11667,7 +11701,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [g_q4 waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-    if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
+    if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i, source_interval)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
     id<MTLBuffer> grab_buf = nil; size_t grab_w = dr.texture.width, grab_h = dr.texture.height;
     if (grab) {
         grab_buf = grab_w && grab_h ? [g_dev newBufferWithLength:grab_w * grab_h * 4 options:MTLResourceStorageModeShared] : nil;
@@ -11784,6 +11818,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
+        fps_overlay_note_displayed(tt, interp >= 0);
         if (interp < 0) g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};   // statistics per game frame; the interpolated one is not a game frame
         cadence_note(tt, interp >= 0);
         front_frame_presented();
@@ -11809,10 +11844,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; int interp, interp_shown; double interp_ts; } pq_item;   // interp (TOTK_MFX): output slot of the frame shown before this one, or -1; interp_ts: the refresh it was shown at   // t_in：游戏把这一帧交进出图队列的时刻（CACurrentMediaTime） | t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; int interp, interp_shown; double interp_ts; uint64_t geometry_epoch; TotkLiveSource source; } pq_item;   // interp (TOTK_MFX): output slot of the frame shown before this one, or -1; interp_ts: the refresh it was shown at   // t_in：游戏把这一帧交进出图队列的时刻（CACurrentMediaTime） | t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
-static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int);
+static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int, uint64_t, TotkLiveSource);
 
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
 @end
@@ -11850,9 +11885,10 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     pq_item *ip = &g_pq[(g_pq_in - 1) % PQ];
-    int interp = ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;   // TOTK_MFX: this tick shows the interpolated frame, a later one the game frame
+    int current=totk_geometry_generated_current(&g_present_geometry,ip->geometry_epoch);
+    int interp = current && ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;   // TOTK_MFX: this tick shows the interpolated frame, a later one the game frame
     double tts = update.targetPresentationTimestamp;
-    if (interp < 0 && ip->interp >= 0 && tts > 0 && ip->interp_ts > 0) {
+    if (current && interp < 0 && ip->interp >= 0 && tts > 0 && ip->interp_ts > 0) {
         /* TOTK_MFX: the game frame goes up at the refresh nearest to half a game frame after its interpolated one, so the
            two pictures share the frame's time evenly (30+30 on a 100 Hz display: two refreshes later, not one; half the
            refresh rate and uncapped: the next refresh). Until then the interpolated picture stays up. */
@@ -11867,7 +11903,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
-    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp); }
+    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp,it.geometry_epoch,it.source); }
     if (!submitted && interp < 0) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
@@ -11962,9 +11998,9 @@ static void *present_main(void *arg) {
            picture is skipped: two pictures per game frame would fall further and further behind. */
         static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
-        int show_interp = it.interp >= 0 && !behind;
-        if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
-        @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1); }
+        int show_interp = it.interp >= 0 && !behind && totk_geometry_generated_current(&g_present_geometry,it.geometry_epoch);
+        if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp,it.geometry_epoch,it.source); } }
+        @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1,it.geometry_epoch,it.source); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
             pthread_mutex_lock(&g_pq_mu);
@@ -11992,9 +12028,9 @@ void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if
    per-frame state. Returns the output slot or -1. */
 static id<MTL4CommandAllocator> g_mfx_alloc[3]; static id<MTL4CommandBuffer> g_mfx_cb[3]; static _Atomic int g_mfx_busy[3];
 static id<MTLTexture> g_mfx_swap_prev;   // TOTK_MFX_DUMP: copy of the previous presented image
-static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
+static int mfx_present_frame_body(const tex_t *t, double period, int discard, TotkLiveSource source_interval) {
     if (t) uw_note_present(t);
-    int slot = mfx_frame_prepare(period);
+    int slot = mfx_frame_prepare(period,source_interval);
     if (slot >= 0) {
         int a = -1; for (int i = 0; i < 3 && a < 0; i++) if (!atomic_load(&g_mfx_busy[i])) a = i;
         if (a < 0 || discard || nogpu()) { mfx_frame_abort(); slot = -1; }
@@ -12046,16 +12082,73 @@ static int mfx_present_frame_body(const tex_t *t, double period, int discard) {
     if (++g_mfx.frames % 300 == 0) { char b[256]; mfx_stats(b, sizeof b); MLOG("[mfx] 至帧 %llu：%s", (unsigned long long)atomic_load(&g_cur_frame), b); }
     return slot;
 }
-static int mfx_present_frame(const tex_t *t, double period, int discard) {
-    @autoreleasepool { return mfx_present_frame_body(t, period, discard); }
+static int mfx_present_frame(const tex_t *t, double period, int discard, TotkLiveSource source_interval) {
+    @autoreleasepool { return mfx_present_frame_body(t, period, discard, source_interval); }
 }
-uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
-    int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
+// Development capture runs without a visible AppKit window or display link.
+// The cross-queue event protects the source read before ticket0 releases the
+// game texture. JPEG work owns the completed buffer on a separate CPU queue.
+#if !TARGET_OS_IPHONE
+static _Atomic int g_duo_capture_busy;
+static id<MTLSharedEvent> g_duo_capture_done;
+static uint64_t g_duo_capture_sequence;
+static dispatch_queue_t g_duo_capture_cpu;
+static void duo_capture_source(const tex_t *texture,const int crop[4],TotkLiveSource source_interval) {
+    if(nogpu() || !totk_duo_capture_pixels || !totk_source_valid(source_interval) || !texture ||
+       !isfinite(source_interval.width) || !isfinite(source_interval.height) || !isfinite(source_interval.scale) ||
+       source_interval.width<32 || source_interval.height<32 || source_interval.scale<=0 || source_interval.scale>8)return;
+    if(atomic_exchange(&g_duo_capture_busy,1))return;
+    id<MTLTexture> src=tex_mtl(texture);
+    size_t height=(size_t)fmax(1,round(fmin(1080,source_interval.height*source_interval.scale)));
+    size_t width=(size_t)fmax(1,round(height*source_interval.aspect)),row=width*4;
+    MTLTextureDescriptor *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
+    descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+    id<MTLTexture> out=src?[g_dev newTextureWithDescriptor:descriptor]:nil;
+    id<MTLBuffer> pixels=out?[g_dev newBufferWithLength:row*height options:MTLResourceStorageModeShared]:nil;
+    id<MTLCommandBuffer> capture=pixels?q_cb():nil;
+    if(!capture){atomic_store(&g_duo_capture_busy,0);return;}
+    [capture encodeWaitForEvent:g_ev value:g_fence];
+    if(!present_encode(capture,src,out,crop,0,source_interval)){atomic_store(&g_duo_capture_busy,0);return;}
+    id<MTLBlitCommandEncoder> copy=[capture blitCommandEncoder];
+    if(!copy){atomic_store(&g_duo_capture_busy,0);return;}
+    [copy copyFromTexture:out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+        sourceSize:MTLSizeMake(width,height,1) toBuffer:pixels destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row*height];
+    [copy endEncoding];
+    if(!g_duo_capture_done)g_duo_capture_done=[g_dev newSharedEvent];
+    if(!g_duo_capture_done){atomic_store(&g_duo_capture_busy,0);return;}
+    if(!g_duo_capture_cpu)g_duo_capture_cpu=dispatch_queue_create("totk.duo.jpeg",DISPATCH_QUEUE_SERIAL);
+    uint64_t sequence=++g_duo_capture_sequence;
+    id<MTLSharedEvent> complete=g_duo_capture_done;
+    [capture encodeSignalEvent:complete value:sequence];
+    [capture addCompletedHandler:^(id<MTLCommandBuffer> done){
+        BOOL success=done.status==MTLCommandBufferStatusCompleted;
+        if(!success && complete.signaledValue<sequence)complete.signaledValue=sequence;
+        dispatch_async(g_duo_capture_cpu,^{
+            if(success)totk_duo_capture_pixels(pixels.contents,width,height,row,1,source_interval);
+            atomic_store(&g_duo_capture_busy,0);
+        });
+    }];
+    cb_commit(capture);
+    [g_q4 waitForEvent:complete value:sequence];
+}
+#endif
+void mtl_present_bind_source(TotkLiveSource source) { g_present_source_interval=source; }
+uint64_t mtl_present_source(const tex_t *t, double period, const int crop[4], TotkLiveSource source_interval) {
+    g_present_source_interval=source_interval;
+    if(!totk_source_valid(source_interval)){mfx_geometry_reset();g_mfx.scene_done=g_mfx.ui_cleared=g_mfx.depth_done=g_mfx.want_cam=0;return 0;}
+    uint64_t geometry_epoch=totk_geometry_now(&g_present_geometry);
+    if(totk_geometry_consume(&g_present_geometry,geometry_epoch))mfx_geometry_reset();
+    int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard, source_interval) : -1;
     if (mfx_latch() && !mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;   // key 2 / flag mfx_interp: the next frame is fully on or off
     if (t && !mfx_enabled() && uw_ratio()) uw_note_present(t);   // key 4: the canvas search (TOTK_MFX does it in mfx_present_frame)
     g_uw_ui = 0;
     if (atomic_load(&g_uw_log) > 0) atomic_fetch_sub(&g_uw_log, 1);
     if (discard) return 0;   // 票号 0 = 没有待完成的上屏，取交换链贴图处不等 | Ticket number 0 = no pending present; the swapchain texture acquire does not wait
+#if !TARGET_OS_IPHONE
+    const char *relay=getenv("DM_DUO_RELAY");
+    if(relay && *relay){duo_capture_source(t,crop,source_interval);return 0;}
+#endif
+
     if (t) { xv_check(t->serial, 0, 0, "出图"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
     link_sync();
@@ -12067,12 +12160,21 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     }
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // 队满才等；正常由 AcquireTexture 先挡住 | Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){.t=*t,.period=period,.frame=atomic_load(&g_cur_frame),.t_in=CACurrentMediaTime(),.interp=islot,
+        .geometry_epoch=geometry_epoch,.source=source_interval};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // 当帧状态随票号入队，不在出图线程晚读可变window | The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     return tk;
+}
+uint64_t mtl_present(const tex_t *t,double period,const int crop[4]) {
+    // Callers without the producer-bound interval can only use static geometry.
+    // Never relabel a dynamic old raster with the latest requested aspect.
+    if(runtime_live_display_enabled && runtime_live_display_enabled())return 0;
+    double aspect=runtime_aspect_now?runtime_aspect_now():0;
+    TotkLiveSource source={.frame=atomic_load(&g_cur_frame),.aspect=aspect>0?aspect:16.0/9,.valid=1,.fallback=1};
+    return mtl_present_source(t,period,crop,source);
 }
 // 丢弃期间不等：标志置上之后才入队的那一帧（出图线程正好走过了标志检查）没人取，等它就又卡住；它留给随后的 mtl_drain 清
 // 节拍模式下不无限等：见 STALL_NS 处的说明。只丢「还没被节拍取走」的帧，已在上屏途中的那张等它交给 GPU（同进后台的丢法）

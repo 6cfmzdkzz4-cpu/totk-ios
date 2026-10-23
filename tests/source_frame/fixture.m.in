@@ -1,0 +1,100 @@
+/* Executes actual receiving renderer routines with synthetic CPU-only peers. */
+#import <Foundation/Foundation.h>
+#include <assert.h>
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+#include "nvn_frame_geometry.h"
+#include "../../../../runtime/dm_display_geometry.h"
+#define MFX_OUT 3
+typedef struct {double originX,originY,width,height,znear,zfar;} MTLViewport;
+static int present_stretch(void){return 0;}
+/* VIEWPORT */
+@protocol MTLTexture
+@property NSUInteger width,height;
+@end
+@interface FakeTexture:NSObject<MTLTexture>
+@property NSUInteger width,height;
+@end
+@implementation FakeTexture @end
+@interface FakeBuffer:NSObject {float data[32];}
+@property(readonly) void *contents;
+@end
+@implementation FakeBuffer
+- (void *)contents{return data;}
+@end
+static struct {
+    uint64_t frames,skip_input,skip_first,skip_cut;
+    id<MTLTexture> depth,ui,enc_depth;
+    int scene_ok,cam_ok,scene_ok_was,cam_ok_was,prev_ok,hist_ok,cur,slot,miss[4];
+    double last_prepare_s,dt,yflip;
+    float cam[84],prev_cam[84];
+    FakeBuffer *mv_par[MFX_OUT];
+} g;
+static TotkLiveSource g_mfx_previous_source,g_mfx_output_source[MFX_OUT];
+static unsigned ensureCalls;
+static double CACurrentMediaTime(void){static double t;t+=1.0/60;return t;}
+static void ensure_fi(NSUInteger w,NSUInteger h){assert(w==1280 && h==720);ensureCalls++;}
+static int camera_cut(void){return 0;}
+static int inv4(const double *a,double *r){(void)a;memset(r,0,16*sizeof *r);return 1;}
+static void mul4(const double *a,const double *b,double *r){(void)a;(void)b;memset(r,0,16*sizeof *r);}
+/* MFX_RESET */
+/* MFX_PREPARE */
+/* MFX_SOURCE */
+typedef struct {int id;} tex_t;
+typedef struct {int ntex;tex_t *tex[4];uint64_t ticket[4];} win_t;
+/* XJOB */
+static unsigned enters,leaves,shots,presents;
+static uint64_t replayFrame;
+static TotkLiveSource bound,received;
+#define CTX(x) (x)
+static void gfx_enter(void){enters++;}
+static void gfx_leave(void){leaves++;}
+void mtl_present_bind_source(TotkLiveSource source){bound=source;}
+void mtl_shot_at_present(const tex_t *texture){assert(texture);shots++;}
+static void mtl_set_frame(uint64_t frame){replayFrame=frame;}
+uint64_t mtl_present_source(const tex_t *t,double period,const int crop[4],TotkLiveSource source){
+    assert(t && period>0 && crop);presents++;received=source;return source.valid?91:0;
+}
+/* PRESENT_EXEC */
+static void inputs(id<MTLTexture> depth){g.depth=depth;g.ui=depth;g.scene_ok=g.cam_ok=1;}
+int main(void){@autoreleasepool{
+    TotkLiveSource closed={.frame=7,.generation=3,.requested_generation=3,.aspect=678.0/466,
+        .width=678,.height=466,.scale=3,.safe_insets={0,0,34,84},.paired=1,.valid=1,.hud_adjustments=7};
+    TotkLiveSource open=closed;open.frame=8;open.generation=4;open.requested_generation=4;
+    open.aspect=951.0/669;open.width=951;open.height=669;open.safe_insets[3]=0;
+    xjob queued={.source=closed};
+    MTLViewport old=present_viewport(951,669,1600,900,queued.source);
+    assert(old.width==951 && old.height<669);
+    MTLViewport fresh=present_viewport(951,669,1600,900,open);
+    assert(fresh.originX==0 && fresh.originY==0 && fresh.width==951 && fresh.height==669);
+    TotkLiveSource phone=closed;phone.aspect=239.0/110;phone.fallback=1;phone.paired=0;
+    MTLViewport legacy=present_viewport(2868,1320,1600,900,phone);
+    assert(legacy.width==2868 && legacy.height==1320);
+    TotkLiveSource invalid=open;invalid.valid=0;
+    assert(present_viewport(951,669,1600,900,invalid).width==0);
+    invalid=closed;invalid.safe_insets[0]=NAN;assert(!totk_source_valid(invalid));
+    tex_t texture={.id=1};win_t window={.ntex=1,.tex={&texture}};int crop[4]={0};
+    present_exec(&window,0,1.0/60,crop,9,queued.source);
+    assert(enters==1 && leaves==1 && shots==1 && presents==1 && replayFrame==9 && window.ticket[0]==91);
+    assert(received.frame==7 && received.generation==3 && received.safe_insets[3]==84 && bound.aspect==closed.aspect);
+    invalid=open;invalid.valid=0;present_exec(&window,0,1.0/60,crop,10,invalid);
+    assert(shots==1 && presents==2 && window.ticket[0]==0); // Retires without capture/presentation.
+    FakeTexture *depth=[FakeTexture new];depth.width=1280;depth.height=720;
+    for(unsigned i=0;i<MFX_OUT;i++)g.mv_par[i]=[FakeBuffer new];
+    inputs(depth);assert(mfx_frame_prepare(1.0/60,closed)==-1);
+    inputs(depth);int slot=mfx_frame_prepare(1.0/60,closed);assert(slot>=0);
+    assert(mfx_output_source(slot).frame==7 && mfx_output_source(slot).safe_insets[3]==84);
+    for(unsigned i=0;i<1000;i++){
+        TotkLiveSource source=i&1?closed:open;source.generation=i+10;source.frame=i+20;
+        inputs(depth);assert(mfx_frame_prepare(1.0/60,source)==-1); // Changed generation never interpolates.
+        inputs(depth);slot=mfx_frame_prepare(1.0/60,source);assert(slot>=0);
+        assert(mfx_output_source(slot).generation==source.generation && mfx_output_source(slot).frame==source.frame);
+    }
+    TotkLiveSource insets=g_mfx_previous_source;insets.safe_insets[1]+=1;
+    inputs(depth);assert(mfx_frame_prepare(1.0/60,insets)==-1); // Defensive even with a malformed reused epoch.
+    unsigned before=ensureCalls;inputs(depth);assert(mfx_frame_prepare(1.0/60,invalid)==-1);
+    assert(ensureCalls==before && !g.prev_ok && !g.hist_ok);
+    puts("PASS: 1000 immutable TOTK source transitions, replay transport, legacy phone fit, invalid retirement and MetalFX discontinuities");
+    return 0;
+}}

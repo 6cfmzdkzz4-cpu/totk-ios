@@ -227,3 +227,13 @@ void fps_overlay_note(uint64_t ticket, double now_s) { rate_note(&g_game, ticket
 int fps_overlay_value(void) { return atomic_load(&g_game.value); }
 void fps_overlay_note_gen(uint64_t n, double now_s) { rate_note(&g_gen, n, now_s); }
 int fps_overlay_gen_value(void) { return atomic_load(&g_gen.value); }
+
+/* Keep submitted/game-ticket rates separate from pictures actually displayed. */
+static _Atomic uint64_t g_displayed_frames, g_generated_frames;
+void fps_overlay_note_displayed(double presented_s, int generated) {
+    if (!isfinite(presented_s) || presented_s <= 0) return;
+    atomic_fetch_add_explicit(&g_displayed_frames, 1, memory_order_relaxed);
+    if (generated) atomic_fetch_add_explicit(&g_generated_frames, 1, memory_order_relaxed);
+}
+uint64_t fps_overlay_displayed_frames(void) { return atomic_load_explicit(&g_displayed_frames, memory_order_relaxed); }
+uint64_t fps_overlay_generated_frames(void) { return atomic_load_explicit(&g_generated_frames, memory_order_relaxed); }

@@ -6,13 +6,15 @@ The game's ARM64 code runs directly on the device. A small host implements the S
 
 ## What works
 
-- iPad: full-screen 4:3, starting at **1920 × 1440**, with higher and lower resolution presets in Settings.
-- iPhone: a **1920 × 1080** canvas fitted to the 239:110 display profile, with lower resolution presets.
+- iPad: full-screen 4:3, starting at **1920 × 1440**.
+- iPhone: a **1920 × 1080** canvas fitted to the 239:110 display profile.
+- The iPad/Duo build follows landscape scene changes from 1:1 through 16:9 with paired camera, viewport and proportionate HUD updates. Unsupported layouts or scene shapes use a verified 4:3 fit. The wide-phone build keeps its separate 239:110 preparation. See [live geometry and evidence limits](docs/live-display.md).
 - Touch controls and physical gamepads. DualSense adds separate handle haptics, motion aiming, light shield resistance and a bow curve that increases through the trigger pull.
 - Contextual hits, landings, conversations, weapon charge, swimming, climbing and skydive textures. Exact audio-derived identities and envelopes are generated locally from the game.
 - Optional CloudKit save handoff between your devices. Routine sync runs in the background after committed saves. Actual conflicting saves require a choice so progress is preserved.
+- A top-left FPS counter: tap to hide it, then tap the same corner to show it again.
 
-The source derives from [MacNativeGames](https://github.com/ly05010419/MacNativeGames), pinned at `15b1afd6255ec777ebceee0c62d33ab90861b07e`. The customized base-1.0.0 iPad build was played with a DualSense and accepted by its tester. The iPhone display and two-way save handoff were also tested in earlier local builds. That is scoped device evidence, not whole-game or sustained frame-rate certification. See [validation](docs/validation.md).
+The source derives from [MacNativeGames](https://github.com/ly05010419/MacNativeGames), pinned at `15b1afd6255ec777ebceee0c62d33ab90861b07e`. The customized base-1.0.0 iPad build was played with a DualSense and accepted by its tester. The iPhone display and two-way save handoff were also tested in earlier local builds. That is scoped device evidence, not whole-game or sustained frame-rate certification. See [validation](docs/validation.md) and [the accepted build-23 release scope](docs/release-readiness23.md).
 
 ## What you need
 
@@ -46,7 +48,8 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install -r games/totk/requirements.txt
 .venv/bin/python -m unittest discover -s tests -v
 python3 tools/test_feedback_policy.py
-python3 tools/audit_publication.py
+python3 games/totk/tests/cloud_coordinator/run.py
+python3 tools/audit_publication.py --staged --history
 ```
 
 Read [AGENTS.md](AGENTS.md) or [CLAUDE.md](CLAUDE.md) before automated changes. The [original upstream README](README.upstream.md) and [architecture notes](docs/how-it-works.md) are retained as background; their legacy commands and other game-version claims are not the supported customized build workflow.
@@ -81,11 +84,11 @@ Related: [Super Mario Odyssey for iPad and iPhone](https://github.com/NicholasDo
    ```sh
    python3.14 tools/ios_build.py "/path/to/TOTK.nsp" \
      --keys "/path/to/prod.keys" --firmware "/path/to/firmware" \
-     --bundle-id com.yourname.totk --display ipad --out dist/TOTK.ipa
+     --bundle-id com.yourname.totk --display ipad --out "dist/Tears of the Kingdom.ipa"
    ```
 
-   Use `--display iphone` for the iPhone profile. If you have already extracted the six BFTTF fonts, replace `--firmware` with `--shared-fonts "/path/to/shared-fonts"`. XCI dumps with the expected system partition can provide their own fonts. The command's `--help` lists the other options.
+   Use `--display duo` (equivalent to `ipad`) for the live narrow/foldable profile, or `--display iphone` for a conventional wide iPhone. Both variants keep the same save identity; install only the matching variant. If you have already extracted the six BFTTF fonts, replace `--firmware` with `--shared-fonts "/path/to/shared-fonts"`. XCI dumps with the expected system partition can provide their own fonts. The command's `--help` lists the other options.
 
-4. **Sign and install.** Sign `dist/TOTK.ipa` with your Apple account using a tool that preserves its increased-memory entitlement, such as [Sideloadly](https://sideloadly.io/). For direct Xcode-managed signing, connect and unlock the device, enable Developer Mode and trust the Mac, then add `--team YOURTEAMID --device YOUR_DEVICE_UDID --install` to step 3 and use `--out dist/TOTK.app`. `xcrun devicectl list devices` lists paired devices. The helper checks the profile before signing; it stops if a required capability is unavailable. For iCloud, first configure your container as described in [the signing guide](docs/signing.md), then also add `--cloud-container iCloud.com.yourname.totk` and use the direct signing route.
+4. **Sign and install.** Sign `dist/Tears of the Kingdom.ipa` with your Apple account using a tool that preserves its increased-memory entitlement, such as [Sideloadly](https://sideloadly.io/). For direct Xcode-managed signing, connect and unlock the device, enable Developer Mode and trust the Mac, then add `--team YOURTEAMID --device YOUR_DEVICE_UDID --install` to step 3 and use `--out "dist/Tears of the Kingdom.app"`. `xcrun devicectl list devices` lists paired devices. The helper checks the profile before signing; it stops if a required capability is unavailable. For iCloud, first configure your container as described in [the signing guide](docs/signing.md), then also add `--cloud-container iCloud.com.yourname.totk` and use the direct signing route.
 
-5. **Open Tears of the Kingdom.** Allow the first shader import to finish, then play. Pair your controller in the device's Bluetooth settings. Resolution, controller haptics, adaptive triggers and gyro preferences live under **Settings → Apps → Tears of the Kingdom**; restart the game after changing them. Keep your chosen bundle ID for future builds and back up `save/` before removing the app.
+5. **Open Tears of the Kingdom.** Allow the first shader import to finish, then play. Pair your controller in the device's Bluetooth settings. Tap the on-screen gear for **Gyro**, **Device haptics** and **Also with controller**, then tap **Done** to apply changes. Existing resolution and controller tuning are retained during updates. Keep your chosen bundle ID for future builds and back up `save/` before removing the app.

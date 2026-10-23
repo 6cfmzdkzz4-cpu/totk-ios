@@ -6,6 +6,8 @@
 #import <Metal/Metal.h>
 #include <stdatomic.h>
 #include "runtime.h"
+#include "totk_scene_geometry.h"
+#include "totk_live_display.h"
 #include "totk_ui_lang.h"
 static CAMetalLayer *metalLayer;
 static UIView *bootOverlay;
@@ -68,10 +70,14 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
 void runtime_warm_done(void){}
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 static _Atomic int appActive=1;
+static _Atomic int appForeground=1, settingsOpen;
 int runtime_front_focus(void){return atomic_load(&appActive);}
 void mtl_app_active(int active);
 /* Not active (background, Control Center, lock): stop GPU submission (iOS rejects background GPU work) and tell the game focus changed, like the Mac window. */
 static void app_active_changed(int active){
+ atomic_store(&appForeground,active);
+ active=active && !atomic_load(&settingsOpen);
+ runtime_device_motion_focus(active);
  runtime_feedback_focus(active);
  if(atomic_exchange(&appActive,active)==active)return;
  if(!active)runtime_input_clear();
@@ -79,6 +85,11 @@ static void app_active_changed(int active){
  mtl_app_active(active);runtime_oe_push_message(15);
  fprintf(stderr,"[totk] app %s\n",active?"became active":"resigned active: GPU submission paused");
 }
+void runtime_ios_settings_open(int open){
+ atomic_store(&settingsOpen,open!=0);
+ app_active_changed(atomic_load(&appForeground));
+}
+void runtime_ios_foreground(int active){app_active_changed(active);}
 void runtime_front_request_close(void){fprintf(stderr,"[totk] close requested; iOS apps are closed by the user\n");}
 void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf(stderr,"[totk] text entry test \"%s\" ignored: iOS has no text entry bar (the keyboard request is cancelled)\n",op?op:"");}
 
@@ -89,23 +100,48 @@ void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf
 @end
 static TOTKVsync *vsyncTarget;
 
+/* Baseline for the selected signed preparation, including explicit fallback. */
+int runtime_ios_live_display_profile(void) {
+ const char *value=getenv("TOTK_LIVE_DISPLAY");return value && !strcmp(value,"1");
+}
+double runtime_ios_picture_aspect(void){
+ double w=0,h=0;char tail;const char *value=getenv("TOTK_ASPECT");
+ if(value && sscanf(value,"%lf:%lf%c",&w,&h,&tail)==2 && isfinite(w) && isfinite(h) && w>0 && h>0)return w/h;
+ return 16.0/9.0;
+}
+void mtl_present_geometry_changed(void);
+int runtime_ios_update_geometry(CAMetalLayer *layer,UIView *host){
+ if(!layer || !host)return 0;
+ CGFloat scale=host.window.screen.nativeScale;
+ if(!(scale>0))scale=host.traitCollection.displayScale;
+ const char *value=getenv("TOTK_IOS_DRAWABLE_H");long maximum=value?strtol(value,NULL,10):720;
+ dm_display_geometry g=totk_scene_drawable(host.bounds.size.width,host.bounds.size.height,scale,maximum);
+ if(!g.valid)return 0; /* transient zero/nonfinite bounds do not replace the last drawable */
+ static __weak CAMetalLayer *previousLayer;
+ static CGSize previousBounds;static CGFloat previousScale;
+ static UIEdgeInsets previousInsets;static UIInterfaceOrientation previousOrientation;
+ UIEdgeInsets insets=host.safeAreaInsets;UIInterfaceOrientation orientation=host.window.windowScene.interfaceOrientation;
+ BOOL sceneChanged=previousLayer!=layer || !CGSizeEqualToSize(previousBounds,host.bounds.size) || previousScale!=scale ||
+     !UIEdgeInsetsEqualToEdgeInsets(previousInsets,insets) || previousOrientation!=orientation;
+ if(runtime_ios_live_display_profile()) {
+  double safe[]={insets.top,insets.left,insets.bottom,insets.right};
+  if(!runtime_live_display_request_scene_mode(host.bounds.size.width,host.bounds.size.height,scale,safe,(unsigned)orientation,
+      !totk_scene_narrow_supported(host.bounds.size.width,host.bounds.size.height)))return 0;
+ }
+ previousLayer=layer;previousBounds=host.bounds.size;previousScale=scale;previousInsets=insets;previousOrientation=orientation;
+ CGSize pixels=CGSizeMake(g.pixel_width,g.pixel_height);
+ if(CGSizeEqualToSize(layer.drawableSize,pixels) && layer.contentsScale==scale)return sceneChanged;
+ layer.contentsScale=scale;layer.drawableSize=pixels;
+ mtl_present_geometry_changed(); /* atomic request; worker owns interpolation history */
+ fprintf(stderr,"[totk-display] drawable %ux%u scale %.3f baseline %.6f live-narrow=%d\n",g.pixel_width,g.pixel_height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile());
+ return 1;
+}
+
 /* Called on the main thread by the app before the game thread starts. */
 void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  bootStartNS=runtime_now_ns();
  metalLayer=layer;metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.framebufferOnly=NO;
- CGFloat s=host.window.screen.nativeScale>0?host.window.screen.nativeScale:UIScreen.mainScreen.nativeScale;
- metalLayer.contentsScale=s;
- /* TOTK_IOS_DRAWABLE_H (default 720; 0 = native pixels): build the drawable this many pixels tall at the view's aspect, so the
-    game picture (1280x720 canvas) lands about 1:1 and the system compositor scales it to the screen instead of our GPU. */
- double vw=round(host.bounds.size.width*s),vh=round(host.bounds.size.height*s);
- const char *dh=getenv("TOTK_IOS_DRAWABLE_H");long want=dh?strtol(dh,NULL,10):720;
- /* the 16:9 picture should get about want rows: a screen narrower than 16:9 (an iPad, about 4:3; 2026-10-17) holds it by
-    width, so there the drawable is want*16/9 columns wide (1281x890 on a 2360x1640 iPad); an iPhone keeps want rows */
- unsigned rw=0,rh=0;const char *render=getenv("TOTK_RENDER_RES");
- double aspect=render&&sscanf(render,"%ux%u",&rw,&rh)==2&&rh ? (double)rw/rh : 16.0/9.0;
- if(want>0){double h=vw/vh<aspect?round(want*aspect*vh/vw):(double)want;if(h<vh){vw=round(vw*h/vh);vh=h;}}
- metalLayer.drawableSize=CGSizeMake(vw,vh);
- fprintf(stderr,"[totk] view drawable %.0fx%.0f (screen scale %.1f, TOTK_IOS_DRAWABLE_H=%ld)\n",vw,vh,s,want);
+ runtime_ios_update_geometry(layer,host);
  bootOverlay=[[UIView alloc] initWithFrame:host.bounds];bootOverlay.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
  bootOverlay.backgroundColor=[UIColor colorWithRed:0.035 green:0.075 blue:0.09 alpha:1];
  CGFloat w=host.bounds.size.width,h=host.bounds.size.height;
@@ -118,6 +154,7 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
  [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(0);}];
  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(1);}];
+ runtime_feedback_focus(UIApplication.sharedApplication.applicationState==UIApplicationStateActive);
  vsyncTarget=[TOTKVsync new];displayLink=[CADisplayLink displayLinkWithTarget:vsyncTarget selector:@selector(tick:)];
  displayLink.preferredFrameRateRange=CAFrameRateRangeMake(60,60,60);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
@@ -125,6 +162,9 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
 void runtime_front_run(void(*callback)(void)){
  if(!metalLayer)runtime_fail("iOS view not attached before boot");
  runtime_gamepad_start();
+ /* Loader initialization resets the observer after view attachment. Rearm its
+    touch-only consumer here, even when no physical controller is connected. */
+ runtime_feedback_focus(atomic_load(&appActive));
  @autoreleasepool{callback();}
 }
 static int viReady;

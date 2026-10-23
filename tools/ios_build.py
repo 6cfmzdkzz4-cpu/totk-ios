@@ -17,6 +17,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 import build_app as upstream
 
+APP_FILENAME = f"{upstream.APP_NAME}.app"
+
 # This exact permission-metadata variant is unused by the native runtime. It
 # carries no valid Nintendo ACID signature. All executable and RomFS gates stay
 # unchanged, and the metadata is never embedded in the personal app.
@@ -56,15 +58,16 @@ def parse_args(argv=None):
     fonts.add_argument("--firmware", type=Path, help="your unpacked firmware NCA directory")
     fonts.add_argument("--shared-fonts", type=Path, help="your previously extracted BFTTF font directory")
     parser.add_argument("--work", type=Path, default=REPO / "work", help="private build cache; never commit it")
-    parser.add_argument("--out", type=Path, default=REPO / "dist/TOTK.app", help="personal .app or .ipa output")
-    parser.add_argument("--display", choices=("ipad", "iphone"), default="ipad")
+    parser.add_argument("--out", type=Path, default=REPO / "dist" / APP_FILENAME, help="personal .app or .ipa output")
+    parser.add_argument("--display", choices=("ipad", "duo", "iphone"), default="ipad",
+                        help="ipad/duo: live narrow camera/HUD (landscape 1:1 to 16:9); iphone: static 239:110")
     parser.add_argument("--bundle-id", required=True, help="your stable application identifier; keep it for future updates")
     parser.add_argument("--cloud-container", default="", help="optional CloudKit container owned by your Apple team")
     parser.add_argument("--team", help="optional Apple development team ID for signing")
     parser.add_argument("--device", help="paired device UDID, required with --team")
     parser.add_argument("--install", action="store_true", help="install only after successful requested signing")
     parser.add_argument("--prepare-only", action="store_true", help="verify/extract inputs and regenerate display/feedback assets, without compiling")
-    parser.add_argument("--build-number", type=int, default=18)
+    parser.add_argument("--build-number", type=int, default=27)
     parser.add_argument("--dotnet", default="dotnet", help=".NET 10 SDK executable used to build the source-only shader translator")
     return parser.parse_args(argv)
 
@@ -158,10 +161,15 @@ def main(argv=None):
     def run(cmd, name):
         upstream.run(cmd, logs / name, cwd=tree, env=env)
     run([tree / ".venv/bin/python", REPO / "tools/prepare_feedback.py", "--romfs", romfs, "--output-dir", tree / "build", "--report-dir", tree / "analysis/feedback"], "prepare-feedback.log")
-    maximum = "2752x2064" if args.display == "ipad" else "1920x1080"
-    if args.display == "ipad":
+    narrow = args.display in ("ipad", "duo")
+    maximum = "2752x2064" if narrow else "1920x1080"
+    if narrow:
         run([tree / ".venv/bin/python", "scripts/make_output_res_overlay.py", maximum], "prepare-output.log")
-    run([tree / ".venv/bin/python", REPO / "tools/prepare_display.py", tree, "--profile", args.display], "prepare-display.log")
+    run([tree / ".venv/bin/python", REPO / "tools/prepare_display.py", tree, "--profile", "ipad" if narrow else "iphone"], "prepare-display.log")
+    if narrow:
+        metadata = tree / "build/totk-live-display-metadata.json"
+        run([tree / ".venv/bin/python", REPO / "tools/prepare_live_display.py", tree, "--output", metadata], "prepare-live-display.log")
+        run([tree / ".venv/bin/python", REPO / "tools/emit_live_display.py", metadata, tree / "build/totk_live_layouts.h"], "emit-live-display.log")
     receipt = {
         "game_version": "1.0.0", "title_id": upstream.EXPECTED["title_id"],
         "input_format": upstream.input_kind(args.game), "display": args.display,
@@ -171,6 +179,8 @@ def main(argv=None):
         "known_unused_metadata_variant": upstream.sha256(tree / "extracted/v0/exefs/main.npdm") == KNOWN_UNUSED_NPDM,
         "rewritten_sha256": {name: upstream.sha256(tree / "rewritten/v0" / name) for name in upstream.EXPECTED["rewritten_sha256"]},
         "generated_feedback_sha256": {p.name: upstream.sha256(p) for p in sorted((tree / "build").glob("gameplay_*.h"))},
+        "live_narrow_display": narrow,
+        "live_layout_header_sha256": upstream.sha256(tree / "build/totk_live_layouts.h") if narrow else None,
         "prepared": True, "compiled": False, "signed": False, "installed": False,
     }
     receipt_path = args.work / "ios-build-receipt.json"
@@ -181,7 +191,7 @@ def main(argv=None):
     ensure_translator(tree, args, logs, env)
     upstream.step_shaders(tree, logs, version="v0")
     upstream.step_binary(tree, args.game, args.keys, env, logs, version="v0")
-    personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal/TOTK.app"
+    personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal" / APP_FILENAME
     run([tree / ".venv/bin/python", "ios/tools/build_ipa.py", "--tree", tree, "--out", personal_app,
          "--version", "v0", "--logs", logs, "--bundle-id", args.bundle_id, "--display", args.display,
          "--build-number", str(args.build_number), "--cloud-container", args.cloud_container, "--app-only"], "build-ios.log")
@@ -197,10 +207,10 @@ def main(argv=None):
         if payload.parent.exists():
             shutil.rmtree(payload.parent)
         payload.mkdir(parents=True)
-        copied = subprocess.run(["cp", "-cR", str(personal_app), str(payload / "TOTK.app")], capture_output=True)
+        copied = subprocess.run(["cp", "-cR", str(personal_app), str(payload / APP_FILENAME)], capture_output=True)
         if copied.returncode:
-            shutil.rmtree(payload / "TOTK.app", ignore_errors=True)
-            shutil.copytree(personal_app, payload / "TOTK.app")
+            shutil.rmtree(payload / APP_FILENAME, ignore_errors=True)
+            shutil.copytree(personal_app, payload / APP_FILENAME)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.unlink(missing_ok=True)
         upstream.run(["zip", "-qry", "-0", args.out, "Payload"], logs / "pack-ipa.log", cwd=payload.parent)

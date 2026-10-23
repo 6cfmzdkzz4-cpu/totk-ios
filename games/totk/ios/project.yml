@@ -19,6 +19,8 @@ targets:
         excludes:
           - frontend.m
           - loader.c
+          - totk_duo_scene.m
+          - totk_duo_capture.m
       - path: ../third_party/d2r_gfx/gfx/nvn
       - path: ../third_party/d2r_gfx/gfx/tex
       - path: Gen/embed.S
@@ -32,6 +34,7 @@ targets:
         CFBundleIdentifier: ${TOTK_BUNDLE_ID}
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "18"
+        NSMotionUsageDescription: "Use device movement for game-native aiming when gyro is enabled."
         TOTKOutputResolution: "2752x2064"
         TOTKDisplayAspect: "4:3"
         UILaunchScreen: {}

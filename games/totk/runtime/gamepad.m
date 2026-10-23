@@ -168,6 +168,7 @@ static void select_controller(GCController *controller) {
     if(primaryController==controller)return;
     if(primaryController)runtime_feedback_detach(primaryController);
     primaryController=controller;
+    runtime_device_motion_controller(controller);
     physicalPrev=0;memset(tapUntil,0,sizeof tapUntil);
     memset(toggleOn,0,sizeof toggleOn);memset(toggleMoved,0,sizeof toggleMoved);
     if(controller)runtime_feedback_attach(controller);
@@ -209,6 +210,9 @@ void runtime_gamepad_start(void) {
 #endif
     if (started) return;
     started = YES;
+#if TARGET_OS_IOS
+    runtime_device_motion_start();
+#endif
     load_controller_map();
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
