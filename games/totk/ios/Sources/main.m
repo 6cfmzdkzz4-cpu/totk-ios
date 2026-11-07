@@ -13,6 +13,7 @@
 #include "totk_scene_geometry.h"
 #include "totk_stable_aspect.h"
 #include "totk_frame_cap.h"
+#include "romfs_mods.h"
 #include "feedback_preferences_ios.h"
 #include "simple_settings_ios.h"
 #import "touch_pad.h"
@@ -152,7 +153,7 @@ void runtime_shortcut_help_toggle(void) {}
     NSUserDefaults *preferences=NSUserDefaults.standardUserDefaults;
     [preferences registerDefaults:@{@"TOTKControllerHaptics":@YES,@"TOTKAdaptiveTriggers":@YES,
         @"TOTKGyroAiming":@YES,@"TOTKResolution":@"1080",@"TOTKFeedbackStrength":@0.9,@"TOTKTriggerStrength":@0.55,
-        TOTK_FRAME_CAP_KEY:@(TOTK_FRAME_CAP_DEFAULT)}];
+        TOTK_FRAME_CAP_KEY:@(TOTK_FRAME_CAP_DEFAULT),@"TOTKRomFSModsEnabled":@NO}];
     totk_simple_settings_initialize(preferences);
     int storedCap=(int)[preferences integerForKey:TOTK_FRAME_CAP_KEY];
     if(totk_frame_cap_unavailable(storedCap)){
@@ -173,7 +174,15 @@ void runtime_shortcut_help_toggle(void) {}
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
     NSString *res = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"GameData"];
-    for (NSString *name in @[@"save", @"temp", @"shader-cache", @"game-slot"]) [fm createDirectoryAtPath:[docs stringByAppendingPathComponent:name] withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *name in @[@"save", @"temp", @"shader-cache", @"game-slot", @"mods"]) [fm createDirectoryAtPath:[docs stringByAppendingPathComponent:name] withIntermediateDirectories:YES attributes:nil error:nil];
+    unsetenv("TOTK_ROMFS_MODS");
+    NSString *mods=[docs stringByAppendingPathComponent:@"mods"];
+    char modsReason[160];
+    int modsState=romfs_mods_inspect(mods.fileSystemRepresentation,[preferences boolForKey:@"TOTKRomFSModsEnabled"],modsReason,sizeof modsReason);
+    if(modsState==ROMFS_MODS_READY){
+        setenv("TOTK_ROMFS_MODS",mods.fileSystemRepresentation,1);
+        fprintf(stderr,"[totk] RomFS mods on: %s (%s)\n",mods.fileSystemRepresentation,modsReason);
+    }else fprintf(stderr,"[totk] RomFS mods off (%s)\n",modsReason[0]?modsReason:"not enabled");
     NSString *log = [docs stringByAppendingPathComponent:@"log.txt"];
     if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0);
     // Display profiles pair their signed camera/UI patches with device-local resolution preferences.

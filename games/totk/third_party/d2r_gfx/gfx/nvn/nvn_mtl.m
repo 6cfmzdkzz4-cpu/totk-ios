@@ -4665,6 +4665,35 @@ static FILE *pso_user_file(void) {
    (the cache directory is shared). g_collect_new: lines added this run (S shaders, R render, C compute pipelines);
    the bottom-left box shows them (shader_overlay_prepare). */
 static NSString *pso_shared_path(void) { return [totk_rt_dir() stringByAppendingPathComponent:@"pso_collected.tsv"]; }
+static NSSet<NSString *> *g_learned_render;
+static os_unfair_lock g_learned_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint64_t g_learned_late;
+static void warm_remember_learned(NSArray<NSString *> *paths) {
+    NSMutableSet<NSString *> *keys = [NSMutableSet set];
+    for (NSString *path in paths) {
+        NSString *name = path.lastPathComponent;
+        if (![name isEqualToString:@"pso_user.tsv"] && ![name isEqualToString:@"pso_collected.tsv"]) continue;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+            if (line.length < 3 || [line hasPrefix:@"#"]) continue;
+            NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+            if ([c[0] isEqualToString:@"R"] && c.count >= 2 && c[1].length) [keys addObject:c[1]];
+        }
+    }
+    os_unfair_lock_lock(&g_learned_lock);
+    g_learned_render = [keys copy];
+    os_unfair_lock_unlock(&g_learned_lock);
+    MLOG("learned render pipelines scheduled before prepared libraries: %lu", (unsigned long)keys.count);
+}
+static void learned_pipeline_on_submit(const char *hex) {
+    if (!hex) return;
+    os_unfair_lock_lock(&g_learned_lock);
+    int known = g_learned_render && [g_learned_render containsObject:@(hex)];
+    os_unfair_lock_unlock(&g_learned_lock);
+    if (!known) return;
+    uint64_t n = atomic_fetch_add(&g_learned_late, 1);
+    if (n < 8) MLOG("learned pipeline compiled on the submit thread (%llu); its saved key was not ready before this draw", (unsigned long long)(n + 1));
+}
 static FILE *g_pso_shared; static int g_pso_shared_checked;
 static _Atomic uint64_t g_collect_new[3], g_collect_last_ns;
 static void pso_user_record(const char *fmt, ...) {
@@ -6020,6 +6049,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
+    learned_pipeline_on_submit(shex);
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6);
     pso_record("R\t%s\n", shex);
     pso_user_record("R\t%s\n", shex);
@@ -6439,11 +6469,16 @@ static void warm_start(void) {
         // 8,290 prepared shaders first the title came after 7-8 s even with warm caches and after about 10 minutes on a
         // Mac whose Metal cache has never seen them. Without the title list the game's manifest goes first, as before.
         if ([fm fileExistsAtPath:title]) [all addObject:title];
-        if ([fm fileExistsAtPath:seed]) [all addObject:seed];
+        /* Learned keys are what this install has already drawn. Build them
+           before the prepared library list. That list reloads every packaged
+           variant and, on one iOS thread, ran for about 30s in build 28 while
+           the world wait is only 15s. Keys left behind it are still created
+           on the submit thread. */
         NSString *user = pso_user_path();
         if (user && [fm fileExistsAtPath:user]) [all addObject:user];
         NSString *shared = pso_shared_path();   // what every session collected (pso_user_record)
         if ([fm fileExistsAtPath:shared]) [all addObject:shared];
+        if ([fm fileExistsAtPath:seed]) [all addObject:seed];
         // The selected version's prepared shaders (real MSL, also on a fresh install) come last: they are shader libraries
         // only, while the lists above also build the pipelines the first scenes need.
         const char *seedMode = getenv("TOTK_SHADER_SEED");
@@ -6454,6 +6489,7 @@ static void warm_start(void) {
         for (NSString *p in paths) { NSString *t = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
             [desc appendFormat:@"%@%@ %lu 行", desc.length ? @"，" : @"", p.lastPathComponent, (unsigned long)[t componentsSeparatedByString:@"\n"].count - 1]; }
         MLOG("预热清单（自动着色器收集）：%s；另加翻译缓存里的全部着色器", desc.UTF8String);
+        warm_remember_learned(all);
     }
     if (!g_warm_items) g_warm_items = [NSMutableArray array];
     NSArray<NSString *> *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:totk_rt_dir() error:nil] sortedArrayUsingSelector:@selector(compare:)] ?: @[];

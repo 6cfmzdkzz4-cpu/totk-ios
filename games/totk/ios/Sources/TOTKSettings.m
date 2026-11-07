@@ -39,16 +39,17 @@ void runtime_ios_apply_frame_cap(void);
     TOTKSettingsNavigation *navigation=(TOTKSettingsNavigation *)self.navigationController;
     [navigation dismissViewControllerAnimated:YES completion:^{[navigation finish];}];
 }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {(void)tableView;return 2;}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {(void)tableView;return 3;}
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    (void)tableView;return section==0?3:4;
+    (void)tableView;return section==0?3:section==1?4:1;
 }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    (void)tableView;return section==0?@"Controls":@"Frame cap";
+    (void)tableView;return section==0?@"Controls":section==1?@"Frame cap":@"RomFS mods";
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     (void)tableView;
     if(section==1)return @"30 and 60 are the only caps this build paces. 30 is the default and holds presents at 30 Hz, with the real-time frame step following that spacing. 60 uses the existing present-interval patch and is a ceiling, not a sustained rate. 90 and 120 are unavailable: the game's interval is a whole 60 Hz tick floored at 1, and frame-counted interface logic diverges above that. No 90 or 120 gameplay patch was added. The top-left counter is a separate display.";
+    if(section==2)return @"Off by default. Applies on the next launch. Put a base 1.0.0 RomFS mod in this app's Files folder mods/, including manifest.tsv. The game checks every file against the installed base data and refuses symlinks and executable or cheat names. ExeFS, pchtxt and emulator cheats are not loaded. Turn this off to use the original files again. If a manifest stops launch, turn it off in the system Settings app for this app.";
     return self.supportsDeviceHaptics?@"Changes apply when you close settings.":@"Device haptics are unavailable on this device. Gyro changes apply when you close settings.";
 }
 - (void)selectFrameCap:(int)hz {
@@ -74,6 +75,18 @@ void runtime_ios_apply_frame_cap(void);
     return cell;
 }
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)path {
+    if(path.section==2){
+        (void)tableView;
+        UITableViewCell *cell=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text=@"Use mods folder";cell.selectionStyle=UITableViewCellSelectionStyleNone;
+        UISwitch *control=[UISwitch new];
+        control.on=[NSUserDefaults.standardUserDefaults boolForKey:@"TOTKRomFSModsEnabled"];
+        control.accessibilityLabel=@"Use mods folder";
+        [control addAction:[UIAction actionWithHandler:^(__kindof UIAction *action){
+            (void)action;[NSUserDefaults.standardUserDefaults setBool:control.on forKey:@"TOTKRomFSModsEnabled"];
+        }] forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView=control;return cell;
+    }
     if(path.section==1)return [self frameCapCellForRow:path.row];
     (void)tableView;
     NSArray *titles=@[@"Gyro",@"Device haptics",@"Also with controller"];

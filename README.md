@@ -100,3 +100,19 @@ Related: [Super Mario Odyssey for iPad and iPhone](https://github.com/NicholasDo
 4. **Sign and install.** Sign `dist/Tears of the Kingdom.ipa` with your Apple account using a tool that preserves its increased-memory entitlement, such as [Sideloadly](https://sideloadly.io/). For direct Xcode-managed signing, connect and unlock the device, enable Developer Mode and trust the Mac, then add `--team YOURTEAMID --device YOUR_DEVICE_UDID --install` to step 3 and use `--out "dist/Tears of the Kingdom.app"`. `xcrun devicectl list devices` lists paired devices. The helper checks the profile before signing; it stops if a required capability is unavailable. For iCloud, first configure your container as described in [the signing guide](docs/signing.md), then also add `--cloud-container iCloud.com.yourname.totk` and use the direct signing route.
 
 5. **Open Tears of the Kingdom.** Allow the first shader import to finish, then play. Pair your controller in the device's Bluetooth settings. Tap the on-screen gear for **Gyro**, **Device haptics** and **Also with controller**, then tap **Done** to apply changes. Existing resolution and controller tuning are retained during updates. Keep your chosen bundle ID for future builds and back up `save/` before removing the app.
+
+## Optional base-1.0.0 RomFS mods
+
+This loads replacement files for the installed base game. It does not load ExeFS patches, pchtxt files, cheat codes, or emulator mods. The switch is off until you turn it on. The original game files in the app stay in place.
+
+1. On the Mac that built the app, put the mod's files under a folder using their RomFS paths, such as `UI/Pack/Example.bntx`.
+2. Write the manifest from that same base 1.0.0 RomFS. A mod built for another version fails the hash check and the game does not start:
+
+   ```sh
+   python3.14 games/totk/scripts/make_mod_manifest.py "/path/to/mod-folder" \
+     --romfs "/path/to/work/totk/extracted/v0/romfs" --version v0
+   ```
+
+3. Copy that folder's contents into the app's `mods` folder with Finder or the Files app. `mods` is next to `save` in the app's documents. Leave `save/` and `shader-cache/` alone.
+4. Turn on **Use mods folder** in the in-app settings or in the system Settings app for this app, then launch again. The log line is `RomFS mods on` or `RomFS mods off`.
+5. Turn **Use mods folder** off and launch again to return to the original files. You do not need to delete the game data to do that.

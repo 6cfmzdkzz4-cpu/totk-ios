@@ -101,6 +101,18 @@ pipeline nor a library, so shader creation is not the only hitch. These figures
 are that session's log, not a new measurement and not a claim that another
 device matches them.
 
+The pipelines created during play are appended to `pso_user.tsv` and
+`pso_collected.tsv`. The next launch's warm-up builds saved keys before it
+reloads the prepared library list. `newRenderPipelineState` remains the
+creation call, including for a saved key the warm-up has not reached; there is
+no separate Metal binary archive. A submit-thread log line, `learned pipeline
+compiled on the submit thread`, means a key that was already on disk was still
+built during play. A second session on the same documents, without deleting
+`save/pso_user.tsv` or the shader cache, is the check: the warm-up count should
+include the previous session's new render rows, and that log line should stay
+quiet for those keys. Keys absent from the previous file are still first
+encounters. This has not been run on a device.
+
 ## The contributor's observation
 
 On an Apple M3 (24 GB, macOS 27.2, game 1.0.0) one session logged 32 long frames above one second, all with

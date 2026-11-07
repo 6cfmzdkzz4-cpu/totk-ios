@@ -70,6 +70,24 @@
 				<integer>60</integer>
 			</array>
 		</dict>
+		<dict>
+			<key>FooterText</key>
+			<string>Off by default. Applies on the next launch. Base 1.0.0 RomFS files in the app's Files folder mods/ are checked against the installed game data. Symlinks and executable or cheat names are refused. ExeFS, pchtxt and emulator cheats are not loaded. Turn this off to use the original files.</string>
+			<key>Title</key>
+			<string>RomFS mods</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<false/>
+			<key>Key</key>
+			<string>TOTKRomFSModsEnabled</string>
+			<key>Title</key>
+			<string>Use mods folder</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
 	</array>
 	<key>StringsTable</key>
 	<string>Root</string>
