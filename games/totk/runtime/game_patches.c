@@ -1,5 +1,6 @@
 #include "game_patches.h"
 #include "aspect_patch.h"
+#include "totk_frame_cap.h"
 #include "game_version.h"
 #include "world_survey.h"
 #include <TargetConditionals.h>
@@ -148,9 +149,11 @@ static void patch_realtime(Module *m) {
     for (size_t i = 0; i < sizeof sites / sizeof *sites; i++)
         put_word(m, sites[i].off, repl[i], "real-time frame step");
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
-    atomic_store(frame_step_data, frame_step_bits(1.0f / 60.0f));
-    fprintf(stderr,"[totk] real-time frame step: %zu verified instructions; initial 16.67 ms, sampled at each present\n",
-            sizeof sites / sizeof *sites);
+    int applied_cap = totk_frame_cap_applied_now();
+    float initial = applied_cap ? 1.0f / (float)applied_cap : 1.0f / 60.0f;
+    atomic_store(frame_step_data, frame_step_bits(initial));
+    fprintf(stderr,"[totk] real-time frame step: %zu verified instructions; initial %.2f ms, sampled at each present\n",
+            sizeof sites / sizeof *sites, initial * 1000.0f);
 }
 
 /* Render resolution (TOTK_RENDER_RES=<w>x<h>, e.g. 960x540).

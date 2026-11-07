@@ -94,7 +94,8 @@ def main():
     p.add_argument('--cloud-container', default='', help='optional private CloudKit container from your Apple team')
     p.add_argument('--build-number', type=int, default=27)
     p.add_argument('--app-only',action='store_true',help='prepare a device app bundle for direct signing and installation')
-    p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: live narrow display; iphone: static wide display')
+    p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: stable 4:3 narrow picture; iphone: static wide display')
+    p.add_argument('--app-icon',type=Path,help='local square JPEG or PNG scaled into the iOS icon set; the source image is not copied into git')
     a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
     if a.build_number < 1: raise RuntimeError('build number must be positive')
     narrow=narrow_profile(a.version,a.display)
@@ -150,6 +151,14 @@ def main():
     if a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')
     if a.version!='v0': project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
+    if a.app_icon:
+        icon=a.app_icon.expanduser().resolve()
+        if not icon.is_file(): raise RuntimeError('app icon must be a local image file')
+        run([sys.executable,ios/'tools/prepare_app_icon.py','--image',icon,'--output',gen/'Assets.xcassets'],tree,logs/'app-icon.log',env)
+        project=project.replace('      - path: Gen/Settings.bundle\n        type: folder\n        buildPhase: resources\n',
+            '      - path: Gen/Settings.bundle\n        type: folder\n        buildPhase: resources\n'
+            '      - path: Gen/Assets.xcassets\n        buildPhase: resources\n')
+        project=project.replace('CODE_SIGNING_ALLOWED: NO\n','CODE_SIGNING_ALLOWED: NO\n      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon\n')
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'

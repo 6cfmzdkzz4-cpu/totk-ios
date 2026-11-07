@@ -26,6 +26,8 @@
 #include "../../../../runtime/totk_duo_capture.h"
 extern void totk_duo_capture_pixels(const void *,size_t,size_t,size_t,int,TotkLiveSource) __attribute__((weak_import));
 #include "../../../../runtime/totk_scene_geometry.h"
+#include "../../../../runtime/totk_stable_aspect.h"
+extern int movie_host_cutscene_active(void) __attribute__((weak_import));
 static totk_geometry_epoch g_present_geometry;
 /* UIKit never enters the queue mutex, Metal or MetalFX here. */
 void mtl_present_geometry_changed(void) { totk_geometry_changed(&g_present_geometry); }
@@ -11179,14 +11181,23 @@ static int present_stretch(void) {
     return on;   // key 4 / TOTK_ASPECT: runtime/aspect_patch.h
 }
 #endif
+static double present_content_aspect(TotkLiveSource source_interval) {
+    /* A started 16:9 decoder means the framebuffer currently holds a movie that
+       was drawn through the stable 4:3 viewport. Fitting 16:9 here restores the
+       movie without moving the UIKit picture or the gameplay camera. */
+    if(totk_stable_aspect_on() && movie_host_cutscene_active && movie_host_cutscene_active())
+        return TOTK_CUTSCENE_ASPECT;
+    return source_interval.aspect;
+}
 static MTLViewport present_viewport(double dw,double dh,double cw,double ch,TotkLiveSource source_interval) {
     if(!totk_source_valid(source_interval) || !isfinite(dw) || !isfinite(dh) || !isfinite(cw) || !isfinite(ch) ||
        dw<=0 || dh<=0 || cw<=0 || ch<=0)return (MTLViewport){0};
-    dm_display_geometry geometry=dm_display_make(dw,dh,1,source_interval.aspect);
+    double aspect=present_content_aspect(source_interval);
+    dm_display_geometry geometry=dm_display_make(dw,dh,1,aspect);
     if(!geometry.valid)return (MTLViewport){0};
     dm_display_rect r=geometry.picture;
     MTLViewport vp={r.x,r.y,r.width,r.height,0,1};
-    if(fabs((dw/dh)/source_interval.aspect-1)<0.01)vp=(MTLViewport){0,0,dw,dh,0,1};
+    if(fabs((dw/dh)/aspect-1)<0.01)vp=(MTLViewport){0,0,dw,dh,0,1};
 #if TARGET_OS_OSX
     if(!source_interval.paired && present_stretch())vp=(MTLViewport){0,0,dw,dh,0,1};
 #endif

@@ -60,7 +60,9 @@ def parse_args(argv=None):
     parser.add_argument("--work", type=Path, default=REPO / "work", help="private build cache; never commit it")
     parser.add_argument("--out", type=Path, default=REPO / "dist" / APP_FILENAME, help="personal .app or .ipa output")
     parser.add_argument("--display", choices=("ipad", "duo", "iphone"), default="ipad",
-                        help="ipad/duo: live narrow camera/HUD (landscape 1:1 to 16:9); iphone: static 239:110")
+                        help="ipad/duo: stable 4:3 picture with constant bars when the scene is wider; iphone: static 239:110")
+    parser.add_argument("--app-icon", type=Path, default=None,
+                        help="optional local square JPEG or PNG for the app icon; it stays on this Mac and is not published")
     parser.add_argument("--bundle-id", required=True, help="your stable application identifier; keep it for future updates")
     parser.add_argument("--cloud-container", default="", help="optional CloudKit container owned by your Apple team")
     parser.add_argument("--team", help="optional Apple development team ID for signing")
@@ -86,6 +88,13 @@ def validate_options(args):
         raise upstream.BuildError("--prepare-only cannot sign or install")
     if args.build_number < 1:
         raise upstream.BuildError("--build-number must be positive")
+    if args.app_icon:
+        args.app_icon = args.app_icon.expanduser().resolve()
+        if not args.app_icon.is_file():
+            raise upstream.BuildError("--app-icon must be a local image file")
+        banned = ("romfs", "exefs", "prod.keys", ".nsp", ".xci", ".nca", "shared-fonts", ".bfttf")
+        if any(part in args.app_icon.as_posix().lower() for part in banned):
+            raise upstream.BuildError("--app-icon must be your own image, not a game, key, font or firmware path")
     for name in ("game", "keys", "work", "out", "firmware", "shared_fonts"):
         if value := getattr(args, name):
             setattr(args, name, value.expanduser().resolve())
@@ -180,6 +189,8 @@ def main(argv=None):
         "rewritten_sha256": {name: upstream.sha256(tree / "rewritten/v0" / name) for name in upstream.EXPECTED["rewritten_sha256"]},
         "generated_feedback_sha256": {p.name: upstream.sha256(p) for p in sorted((tree / "build").glob("gameplay_*.h"))},
         "live_narrow_display": narrow,
+        "stable_aspect": "4:3" if narrow else None,
+        "app_icon_sha256": upstream.sha256(args.app_icon) if args.app_icon else None,
         "live_layout_header_sha256": upstream.sha256(tree / "build/totk_live_layouts.h") if narrow else None,
         "prepared": True, "compiled": False, "signed": False, "installed": False,
     }
@@ -192,9 +203,12 @@ def main(argv=None):
     upstream.step_shaders(tree, logs, version="v0")
     upstream.step_binary(tree, args.game, args.keys, env, logs, version="v0")
     personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal" / APP_FILENAME
-    run([tree / ".venv/bin/python", "ios/tools/build_ipa.py", "--tree", tree, "--out", personal_app,
-         "--version", "v0", "--logs", logs, "--bundle-id", args.bundle_id, "--display", args.display,
-         "--build-number", str(args.build_number), "--cloud-container", args.cloud_container, "--app-only"], "build-ios.log")
+    ios_cmd = [tree / ".venv/bin/python", "ios/tools/build_ipa.py", "--tree", tree, "--out", personal_app,
+               "--version", "v0", "--logs", logs, "--bundle-id", args.bundle_id, "--display", args.display,
+               "--build-number", str(args.build_number), "--cloud-container", args.cloud_container, "--app-only"]
+    if args.app_icon:
+        ios_cmd.extend(["--app-icon", str(args.app_icon)])
+    run(ios_cmd, "build-ios.log")
     receipt["compiled"] = True
     receipt["ios_dependencies"] = json.loads((tree / "build/ios-deps/manifest.json").read_text())
     if args.team:

@@ -42,6 +42,34 @@
 			<key>Type</key>
 			<string>PSToggleSwitchSpecifier</string>
 		</dict>
+		<dict>
+			<key>FooterText</key>
+			<string>30 and 60 are the only caps. 90 and 120 are unavailable: the game interval is a 60 Hz tick floored at 1, and this build adds no 90 or 120 gameplay patch.</string>
+			<key>Title</key>
+			<string>Frame cap</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<integer>30</integer>
+			<key>Key</key>
+			<string>TOTKFrameCap</string>
+			<key>Title</key>
+			<string>Frame cap</string>
+			<key>Titles</key>
+			<array>
+				<string>30 FPS</string>
+				<string>60 FPS</string>
+			</array>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
+			<key>Values</key>
+			<array>
+				<integer>30</integer>
+				<integer>60</integer>
+			</array>
+		</dict>
 	</array>
 	<key>StringsTable</key>
 	<string>Root</string>
