@@ -4486,7 +4486,12 @@ static void shmap_load(void) {
     // 库目录 = <DM_MSL_DIR 或缺省缓存>/b-<翻译链版本>：版本取自本源码树的 dmsh_chain.h（tools/dmsh_chain.py），旧源码树编的宿主只认旧版本的库
     // Library directory = <DM_MSL_DIR or default cache>/b-<translation chain version>: the version comes from this source tree's dmsh_chain.h (tools/dmsh_chain.py); a host built from an old source tree only accepts libraries of the old version
     g_msl_dir = [NSString stringWithFormat:@"%@/b-%s", m ? @(m) : exe_rel("shader-cache"), DMSH_CHAIN];
-    if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir]) MLOG("预编译 metallib 包 %s 不存在；使用本机运行时翻译缓存预热", g_msl_dir.UTF8String);
+    /* The b-<chain> directory is the legacy packed layout. iOS stores each
+       prepared variant as <variant>_b.metallib in the runtime cache and
+       shader_load uses that file first. Its absence is not a missing shader
+       and does not by itself select source compilation. */
+    if (![NSFileManager.defaultManager fileExistsAtPath:g_msl_dir])
+        MLOG("legacy metallib directory %s is absent; precompiled variants still load from the runtime cache as *_b.metallib, and source compilation runs only when that variant file is absent too", g_msl_dir.UTF8String);
     NSString *cp = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"c1_full.tsv"];   // 与映射表同目录（Mac：dm/gfx/nvn；iOS：App 内 dm/，run.sh 一起拷） | Same directory as the mapping table (Mac: dm/gfx/nvn; iOS: dm/ inside the App, copied along by run.sh)
     NSString *ct = cp ? [NSString stringWithContentsOfFile:cp encoding:NSUTF8StringEncoding error:nil] : nil;
     NSString *head = ct ? [[ct componentsSeparatedByString:@"\n"] firstObject] : nil;
