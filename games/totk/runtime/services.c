@@ -15,7 +15,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
-#include <os/proc.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>   /* os_proc_available_memory(): iOS/iPadOS only; unavailable on macOS */
+#endif
 #include <dispatch/dispatch.h>
 /* Guest address layout. The SDK encodes IPC buffer addresses with 39 bits (HIPC descriptor bits 36..38),
    so all guest memory must lie below 2^39. Darwin arm64 keeps 0x10_0000_0000..0x70_0000_0000 reserved,
@@ -216,9 +218,18 @@ static void host_budget_log(const char *reason, uint64_t failed_bytes) {
  kern_return_t kr=task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&info,&count);
  unsigned long long footprint=kr==KERN_SUCCESS?(unsigned long long)info.phys_footprint:0;
  unsigned long long resident=kr==KERN_SUCCESS?(unsigned long long)info.resident_size:0;
+ /* available is bytes still allowed before the process limit. os_proc_available_memory() exists on iOS and is
+    unavailable on macOS. The macOS line uses available=-1 and available_status=unavailable. -1 is not a byte count
+    and is not zero headroom. */
+#if TARGET_OS_IPHONE
  long long available=(long long)os_proc_available_memory();
- fprintf(stderr,"[totk-mem] budget unix=%lld reason=%s footprint=%llu resident=%llu available=%lld failed_bytes=%llu pool=%#llx heap=%#llx alias_mapped=%#llx\n",
-  (long long)time(NULL),reason,footprint,resident,available,(unsigned long long)failed_bytes,(unsigned long long)APP_POOL,(unsigned long long)heap_size,(unsigned long long)alias_bytes);
+ const char *available_status="measured";
+#else
+ long long available=-1;
+ const char *available_status="unavailable";
+#endif
+ fprintf(stderr,"[totk-mem] budget unix=%lld reason=%s footprint=%llu resident=%llu available=%lld available_status=%s failed_bytes=%llu pool=%#llx heap=%#llx alias_mapped=%#llx\n",
+  (long long)time(NULL),reason,footprint,resident,available,available_status,(unsigned long long)failed_bytes,(unsigned long long)APP_POOL,(unsigned long long)heap_size,(unsigned long long)alias_bytes);
 }
 static void host_pressure_event(void *context) {
  unsigned long mask=dispatch_source_get_data((dispatch_source_t)context);
