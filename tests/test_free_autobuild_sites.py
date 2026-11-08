@@ -65,6 +65,10 @@ class FreeAutobuildSites(unittest.TestCase):
         self.assertEqual(trial['TOTK_FREE_AUTOBUILD_EXPORT'], '1')
         for site in (0x1714820, 0x1717610, 0xd46270):
             self.assertNotIn(site, sites.runtime_sites())
+        driver = (ROOT/'tools/ios_build.py').read_text()
+        self.assertIn('required = 25 if cached', driver)
+        self.assertIn('--experimental-free-autobuild', driver)
+        self.assertIn('com.willspain.totk.freeautobuild', driver)
     def test_cheat_menu_stays_off_the_production_bundle_and_does_not_apply_writes(self):
         settings = (ROOT/'games/totk/ios/Sources/TOTKSettings.m').read_text()
         patches = (ROOT/'games/totk/runtime/game_patches.c').read_text()

@@ -69,6 +69,8 @@ def parse_args(argv=None):
     parser.add_argument("--device", help="paired device UDID, required with --team")
     parser.add_argument("--install", action="store_true", help="install only after successful requested signing")
     parser.add_argument("--prepare-only", action="store_true", help="verify/extract inputs and regenerate display/feedback assets, without compiling")
+    parser.add_argument("--experimental-free-autobuild", action="store_true",
+                        help="build the separate Free Autobuild trial; refuses com.willspain.totk")
     parser.add_argument("--build-number", type=int, default=27)
     parser.add_argument("--dotnet", default="dotnet", help=".NET 10 SDK executable used to build the source-only shader translator")
     return parser.parse_args(argv)
@@ -202,10 +204,18 @@ def main(argv=None):
     ensure_translator(tree, args, logs, env)
     upstream.step_shaders(tree, logs, version="v0")
     upstream.step_binary(tree, args.game, args.keys, env, logs, version="v0")
-    personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal" / APP_FILENAME
+    if args.experimental_free_autobuild:
+        if args.bundle_id != "com.willspain.totk.freeautobuild" or "FreeAutobuild" not in args.out.name:
+            raise upstream.BuildError("experimental Free Autobuild requires --bundle-id com.willspain.totk.freeautobuild and an output name containing FreeAutobuild")
+        if args.cloud_container:
+            raise upstream.BuildError("experimental Free Autobuild must not use a CloudKit container")
+    personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal" / (
+        "TOTK Free Autobuild.app" if args.experimental_free_autobuild else APP_FILENAME)
     ios_cmd = [tree / ".venv/bin/python", "ios/tools/build_ipa.py", "--tree", tree, "--out", personal_app,
                "--version", "v0", "--logs", logs, "--bundle-id", args.bundle_id, "--display", args.display,
                "--build-number", str(args.build_number), "--cloud-container", args.cloud_container, "--app-only"]
+    if args.experimental_free_autobuild:
+        ios_cmd.append("--experimental-free-autobuild")
     if args.app_icon:
         ios_cmd.extend(["--app-icon", str(args.app_icon)])
     run(ios_cmd, "build-ios.log")
