@@ -39,17 +39,25 @@ void runtime_ios_apply_frame_cap(void);
     TOTKSettingsNavigation *navigation=(TOTKSettingsNavigation *)self.navigationController;
     [navigation dismissViewControllerAnimated:YES completion:^{[navigation finish];}];
 }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {(void)tableView;return 3;}
+- (BOOL)experimentalCheats {
+    return [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.willspain.totk.freeautobuild"];
+}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {(void)tableView;return self.experimentalCheats?4:3;}
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    (void)tableView;return section==0?3:section==1?4:1;
+    (void)tableView;return section==0?3:section==1?4:section==3?2:1;
 }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    (void)tableView;return section==0?@"Controls":section==1?@"Frame cap":@"RomFS mods";
+    (void)tableView;
+    if(section==0)return @"Controls";
+    if(section==1)return @"Frame cap";
+    if(section==3)return @"Experimental cheats";
+    return @"RomFS mods";
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     (void)tableView;
     if(section==1)return @"30 and 60 are the only caps this build paces. 30 is the default and holds presents at 30 Hz, with the real-time frame step following that spacing. 60 uses the existing present-interval patch and is a ceiling, not a sustained rate. 90 and 120 are unavailable: the game's interval is a whole 60 Hz tick floored at 1, and frame-counted interface logic diverges above that. No 90 or 120 gameplay patch was added. The top-left counter is a separate display.";
     if(section==2)return @"Off by default. Applies on the next launch. Put a base 1.0.0 RomFS mod in this app's Files folder mods/, including manifest.tsv. The game checks every file against the installed base data and refuses symlinks and executable or cheat names. ExeFS, pchtxt and emulator cheats are not loaded. Turn this off to use the original files again. If a manifest stops launch, turn it off in the system Settings app for this app.";
+    if(section==3)return @"These rows are unavailable. Free Autobuild is three code writes, not a RomFS mod. iOS cannot change those instructions from this menu or on the next launch. A Mac export can include them only after the pinned 1.0.0 site check passes, and only in this experimental app. Infinite items has no base 1.0.0 site, so it cannot stop normal consumable use, spawn story items, or edit saves. This app does not import saves from com.willspain.totk and does not add health, currency, or combat cheats.";
     return self.supportsDeviceHaptics?@"Changes apply when you close settings.":@"Device haptics are unavailable on this device. Gyro changes apply when you close settings.";
 }
 - (void)selectFrameCap:(int)hz {
@@ -74,7 +82,19 @@ void runtime_ios_apply_frame_cap(void);
     cell.accessibilityHint=unavailable?@"Unavailable":nil;
     return cell;
 }
+- (UITableViewCell *)unavailableCheatCell:(NSString *)title {
+    UITableViewCell *cell=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    cell.textLabel.text=title;
+    cell.detailTextLabel.text=@"Unavailable";
+    cell.textLabel.textColor=UIColor.secondaryLabelColor;
+    cell.selectionStyle=UITableViewCellSelectionStyleNone;
+    cell.userInteractionEnabled=NO;
+    cell.accessibilityLabel=[NSString stringWithFormat:@"%@, Unavailable",title];
+    cell.accessibilityHint=@"Unavailable";
+    return cell;
+}
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)path {
+    if(path.section==3)return [self unavailableCheatCell:path.row==0?@"Free Autobuild":@"Infinite items"];
     if(path.section==2){
         (void)tableView;
         UITableViewCell *cell=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
