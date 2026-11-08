@@ -173,6 +173,55 @@ class AutobuildDiagnostic(unittest.TestCase):
         self.assertEqual(linked.returncode, 2)
         self.assertEqual(json.loads(linked.stdout)['status'], 'refused')
 
+    def test_stage2_splits_a_branch_from_a_single_bit_write(self):
+        orr = 0x32000108  # orr w8, w8, #1
+        cbz = 0x34000008
+        rows = diag._reach([diag.detail_word(word) for word in (orr, cbz, NOP, 0xD65F03C0)])
+        self.assertEqual(rows[0]['class'], 'orr_imm')
+        self.assertTrue(rows[0]['logical_single_bit'])
+        self.assertEqual(rows[1]['prior_def_class'], 'orr_imm')
+        self.assertEqual(rows[1]['prior_def_index'], 0)
+        self.assertEqual(diag.detail_word(PROLOGUE)['class'], 'stp')
+        self.assertEqual(diag.detail_word(0)['class'], 'other')
+        found = diag.conclude(rows, [], {token: 0 for token in diag.ROLE_TOKENS}, None)
+        self.assertFalse(found['stop'])
+        self.assertIn('green_window_data_op', found['leads'])
+        self.assertIsNone(found['candidates']['appearance_only_no_green'])
+        self.assertEqual(found['separation_possible'], 'unknown')
+        self.assertNotIn(f'{orr:08x}', json.dumps(rows))
+
+    def test_stage2_stops_when_no_narrow_data_or_material_role_exists(self):
+        rows = diag._reach([diag.detail_word(word) for word in (NOP, NOP, NOP, 0xD65F03C0)])
+        roles = {token: 0 for token in diag.ROLE_TOKENS}
+        paths = diag.romfs_role_counts([
+            'UI/Layout/AutoBuilder_00.bflyt', 'Actor/Zonau.pack', 'Model/Zonau/Body.bfres',
+        ])
+        found = diag.conclude(rows, [], roles, paths)
+        self.assertTrue(found['stop'])
+        self.assertFalse(found['cost_identified'])
+        self.assertFalse(found['tint_isolated_by_this_evidence'])
+        self.assertEqual(paths['autobuilder_count'], 1)
+        self.assertEqual(paths['token_counts']['Material'], 0)
+        self.assertEqual(paths['zonau_and_autobuilder'], 0)
+        self.assertTrue(paths['archives_not_opened'])
+
+    def test_stage2_image_does_not_emit_strings_or_words(self):
+        raw = image_with_sites(CLAIM)
+        report = diag.analyze_stage2(raw, hashlib.sha256(raw).hexdigest(), claim_address=0x200)
+        self.assertTrue(report['bytes_read'])
+        self.assertFalse(report['green_function']['found'])
+        self.assertEqual([row['class'] for row in report['green_window']], ['str_imm', 'str_imm', 'nop', 'ret'])
+        self.assertFalse(report['conclusion']['stop'])
+        self.assertIsNone(report['conclusion']['candidates']['zero_zonaite_autobuild_cost'])
+        encoded = json.dumps(report)
+        self.assertNotIn('ZonauEnergyCell', encoded)
+        self.assertNotIn('3900013f', encoded)
+        done = subprocess.run([
+            sys.executable, str(SCRIPT), '--stage', '2', '--fixture', '--main', '/dev/null',
+            '--expect-sha', '00',
+        ], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2)
+
 
 if __name__ == '__main__':
     unittest.main()
