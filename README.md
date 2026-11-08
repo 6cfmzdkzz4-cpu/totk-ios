@@ -113,6 +113,8 @@ This loads replacement files for the installed base game. It does not load ExeFS
      --romfs "/path/to/work/totk/extracted/v0/romfs" --version v0
    ```
 
+   That generator is `games/totk/scripts/make_mod_manifest.py` in this repository. `git ls-files games/totk/scripts/make_mod_manifest.py` prints that path. `--version` must be `v0`. A built iOS app can be used instead of the work tree: `--app "dist/Tears of the Kingdom.app" --version v0` reads `GameData/romfs`.
+
 3. Copy that folder's contents into the app's `mods` folder with Finder or the Files app. `mods` is next to `save` in the app's documents. Leave `save/` and `shader-cache/` alone.
 4. Turn on **Use mods folder** in the in-app settings or in the system Settings app for this app, then launch again. The log line is `RomFS mods on` or `RomFS mods off`.
 5. Turn **Use mods folder** off and launch again to return to the original files. You do not need to delete the game data to do that.

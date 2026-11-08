@@ -1,9 +1,18 @@
-#define _POSIX_C_SOURCE 200809L
+/* Darwin hides O_NOFOLLOW when _POSIX_C_SOURCE is set without _DARWIN_C_SOURCE.
+   _GNU_SOURCE selects the real flag on both Darwin and glibc. Do not define
+   O_NOFOLLOW to 0: a missing flag must fail the build. */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
+#define _GNU_SOURCE 1
 #include "romfs_mods.h"
 #include <stdint.h>
 #include "romfs_path.h"
 #include <errno.h>
 #include <fcntl.h>
+#ifndef O_NOFOLLOW
+#error "O_NOFOLLOW is required so RomFS mods cannot follow symlinks"
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -80,10 +89,18 @@ int romfs_mods_inspect(const char *directory, int enabled, char *reason, size_t 
     if (!file) { close(manifest); close(root); return explain(reason, reason_size, ROMFS_MODS_REJECTED, "manifest cannot be read"); }
     char line[8192];
     unsigned files = 0;
+    int saw_base = 0;
     int status = ROMFS_MODS_READY;
     const char *why = "ready";
     while (fgets(line, sizeof line, file)) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            if (!strncmp(line, "# game-version ", 15)) {
+                if (!strncmp(line, "# game-version v0", 17) && (line[17] == '\n' || line[17] == '\r' || line[17] == 0))
+                    saw_base = 1;
+                else { status = ROMFS_MODS_REJECTED; why = "manifest is not base 1.0.0"; break; }
+            }
+            continue;
+        }
         char name[4096], sha[65], orig[65];
         unsigned long long size = 0;
         if (sscanf(line, "%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f-]", name, &size, sha, orig) != 4
@@ -103,6 +120,7 @@ int romfs_mods_inspect(const char *directory, int enabled, char *reason, size_t 
     }
     fclose(file);
     close(root);
+    if (status == ROMFS_MODS_READY && !saw_base) return explain(reason, reason_size, ROMFS_MODS_REJECTED, "manifest does not say base 1.0.0");
     if (status == ROMFS_MODS_READY && !files) return explain(reason, reason_size, ROMFS_MODS_REJECTED, "manifest lists no files");
     return explain(reason, reason_size, status, why);
 }

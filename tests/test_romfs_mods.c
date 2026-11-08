@@ -1,4 +1,7 @@
-#define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
+#define _GNU_SOURCE 1
 #include "../games/totk/runtime/romfs_mods.h"
 #include <assert.h>
 #include <stdio.h>
@@ -34,9 +37,14 @@ int main(void) {
     assert(mkdir(ui, 0755) == 0);
     assert(mkdir(nested, 0755) == 0);
     write_file(payload, "mod-bytes");
-    write_file(manifest, "UI/Pack/Example.bntx\t9\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\t-\n");
+    write_file(manifest, "# game-version v0\nUI/Pack/Example.bntx\t9\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\t-\n");
     CHECK(romfs_mods_inspect(dir, 0, reason, sizeof reason) == ROMFS_MODS_OFF);
+    CHECK(strcmp(reason, "disabled") == 0);
     CHECK(romfs_mods_inspect(dir, 1, reason, sizeof reason) == ROMFS_MODS_READY);
+    write_file(manifest, "# game-version v143\nUI/Pack/Example.bntx\t9\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\t-\n");
+    CHECK(romfs_mods_inspect(dir, 1, reason, sizeof reason) == ROMFS_MODS_REJECTED);
+    CHECK(strstr(reason, "1.0.0"));
+    write_file(manifest, "# game-version v0\nUI/Pack/Example.bntx\t9\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\t-\n");
 
     write_file(manifest, "../secret\t1\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\t-\n");
     CHECK(romfs_mods_inspect(dir, 1, reason, sizeof reason) == ROMFS_MODS_REJECTED);
