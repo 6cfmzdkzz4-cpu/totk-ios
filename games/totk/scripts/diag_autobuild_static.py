@@ -712,6 +712,24 @@ def romfs_report(index_path: Path | None, bin_path: Path | None, expect_sha: str
     return report
 
 
+STORE_FIELDS = ('base', 'offset', 'source_zero', 'source_reg', 'index_reg', 'width')
+
+
+def _store_record(index: int, detail: dict) -> dict:
+    """Copy a store descriptor. A missing offset stays absent; it is not reported as zero."""
+    mem = detail.get('mem')
+    kind = detail.get('class', 'unknown')
+    if not isinstance(mem, dict) or mem.get('op') != 'store':
+        raise ValueError(f'store record for class {kind} has no store descriptor')
+    record = {'index': index, 'class': kind}
+    for key in STORE_FIELDS:
+        if key in mem:
+            record[key] = mem[key]
+    if 'offset' not in mem:
+        record['offset_decoded'] = False
+    return record
+
+
 def _public_detail(row: dict) -> dict:
     kept = ('class', 'dests', 'uses', 'flags_write', 'flags_read', 'mem', 'ctrl',
             'logical_bit_count', 'logical_single_bit', 'small_immediate', 'immediate_above_64')
@@ -947,10 +965,11 @@ def analyze_stage2(raw: bytes, expect_sha: str, claim_build_id: str = GREEN_CLAI
     calls = []
     pointers = []
     for row, detail in zip(reached, details):
-        if detail['mem'] and detail['mem']['op'] == 'store':
-            stores.append({'index': row['index'], 'class': detail['class'], 'base': detail['mem']['base'],
-                           'offset': detail['mem']['offset'], 'source_zero': detail['mem']['source_zero'],
-                           'source_reg': detail['mem']['source_reg']})
+        mem = detail.get('mem')
+        if isinstance(mem, dict) and mem.get('op') == 'store':
+            stores.append(_store_record(row['index'], detail))
+        elif mem is not None and not isinstance(mem, dict):
+            raise ValueError(f"store record for class {detail.get('class', 'unknown')} has no store descriptor")
         if detail['class'] in {'cbz', 'cbnz', 'tbz', 'tbnz'}:
             branches.append({key: row[key] for key in ('index', 'class', 'prior_def_index', 'prior_def_class') if key in row})
         if detail['class'] == 'bl' and detail.get('target') is not None:

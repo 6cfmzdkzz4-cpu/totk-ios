@@ -173,6 +173,26 @@ class AutobuildDiagnostic(unittest.TestCase):
         self.assertEqual(linked.returncode, 2)
         self.assertEqual(json.loads(linked.stdout)['status'], 'refused')
 
+    def test_store_without_offset_is_reported_and_does_not_crash(self):
+        stp = diag.detail_word(PROLOGUE)
+        self.assertEqual(stp['class'], 'stp')
+        self.assertNotIn('offset', stp['mem'])
+        partial = {'class': 'unrecognized_store', 'mem': {'op': 'store', 'base': 4}}
+        records = [diag._store_record(0, stp), diag._store_record(1, partial),
+                   diag._store_record(2, diag.detail_word(STR_WZR_X9_0X48))]
+        self.assertEqual(records[0]['class'], 'stp')
+        self.assertNotIn('offset', records[0])
+        self.assertFalse(records[0]['offset_decoded'])
+        self.assertEqual(records[0]['base'], 31)
+        self.assertFalse(records[1]['offset_decoded'])
+        self.assertEqual(records[1]['base'], 4)
+        self.assertEqual(records[2]['offset'], 0x48)
+        self.assertNotIn('offset_decoded', records[2])
+        with self.assertRaises(ValueError) as caught:
+            diag._store_record(3, {'class': 'broken', 'mem': None})
+        self.assertIn('broken', str(caught.exception))
+        self.assertNotIn(f'{PROLOGUE:08x}', json.dumps(records))
+
     def test_stage2_splits_a_branch_from_a_single_bit_write(self):
         orr = 0x32000108  # orr w8, w8, #1
         cbz = 0x34000008
