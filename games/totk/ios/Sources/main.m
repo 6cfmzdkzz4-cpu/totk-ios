@@ -153,7 +153,7 @@ void runtime_shortcut_help_toggle(void) {}
     NSUserDefaults *preferences=NSUserDefaults.standardUserDefaults;
     [preferences registerDefaults:@{@"TOTKControllerHaptics":@YES,@"TOTKAdaptiveTriggers":@YES,
         @"TOTKGyroAiming":@YES,@"TOTKResolution":@"1080",@"TOTKFeedbackStrength":@0.9,@"TOTKTriggerStrength":@0.55,
-        TOTK_FRAME_CAP_KEY:@(TOTK_FRAME_CAP_DEFAULT),@"TOTKRomFSModsEnabled":@NO}];
+        TOTK_FRAME_CAP_KEY:@(TOTK_FRAME_CAP_DEFAULT),@"TOTKRomFSModsEnabled":@NO,@"TOTKFreeAutobuild":@NO}];
     totk_simple_settings_initialize(preferences);
     int storedCap=(int)[preferences integerForKey:TOTK_FRAME_CAP_KEY];
     if(totk_frame_cap_unavailable(storedCap)){
@@ -235,6 +235,9 @@ void runtime_shortcut_help_toggle(void) {}
     for (NSString *name in @[@"TOTK_GPU_ALLOW_SUBMIT",@"TOTK_GPU_WIDEN",@"TOTK_GPU_BLOCKRT",@"TOTK_GPU_MIDCLEAR"]) setenv(name.UTF8String,"1",1);
     setenv("TOTK_SLOT_OWNER","user",0); setenv("TOTK_SLOT_PURPOSE","player",0);
     unsetenv("TOTK_AUTOLOAD");
+    if([[NSBundle.mainBundle bundleIdentifier] isEqualToString:@"com.willspain.totk.freeautobuild"])
+        setenv("TOTK_FREE_AUTOBUILD",[preferences boolForKey:@"TOTKFreeAutobuild"]?"1":"0",1);
+    else unsetenv("TOTK_FREE_AUTOBUILD");
     chdir(docs.fileSystemRepresentation);
     host_argv[0] = strdup("TOTK"); host_argv[1] = strdup(res.fileSystemRepresentation); host_argv[2] = strdup("boot");
     return YES;

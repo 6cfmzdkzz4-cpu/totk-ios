@@ -59,11 +59,25 @@ def narrow_profile(version, display):
     return version=='v0' and display in ('ipad','duo')
 
 
-def display_export_env(env, tree, modules, version, display):
+def experimental_free_autobuild(bundle_id, app_name, cloud_container, version):
+    """Keep the trial off the installed production identity and off iCloud saves."""
+    if bundle_id == 'com.willspain.totk':
+        raise RuntimeError('experimental Free Autobuild must not replace com.willspain.totk')
+    if bundle_id != 'com.willspain.totk.freeautobuild':
+        raise RuntimeError('experimental Free Autobuild requires --bundle-id com.willspain.totk.freeautobuild')
+    if version != 'v0':
+        raise RuntimeError('experimental Free Autobuild is base 1.0.0 only')
+    if cloud_container:
+        raise RuntimeError('experimental Free Autobuild must not use a CloudKit container')
+    return 'TOTK Free Autobuild' if app_name == 'Tears of the Kingdom' else app_name
+
+
+def display_export_env(env, tree, modules, version, display, experimental=False):
     """Export code only, with no inherited relay/audit or mismatched aspect."""
     result=dict(env,TOTK_EXPORT_IOS=str(modules))
     for key in ('TOTK_ASPECT','TOTK_IPAD_ASPECT_PATCH','TOTK_IPHONE_ASPECT_PATCH','TOTK_PCHTXT',
-                'TOTK_ASPECT_UI_PATCHED','TOTK_LIVE_DISPLAY','TOTK_LIVE_DISPLAY_AUDIT','DM_DUO_RELAY'):
+                'TOTK_ASPECT_UI_PATCHED','TOTK_LIVE_DISPLAY','TOTK_LIVE_DISPLAY_AUDIT','DM_DUO_RELAY',
+                'TOTK_FREE_AUTOBUILD_EXPORT'):
         result.pop(key,None)
     if narrow_profile(version,display):
         result.update(TOTK_OUTPUT_RES='2752x2064',TOTK_RENDER_RES='2752x2064',TOTK_LIVE_DISPLAY='1',
@@ -71,6 +85,8 @@ def display_export_env(env, tree, modules, version, display):
     elif version=='v0':
         result.update(TOTK_OUTPUT_RES='1920x1080',TOTK_RENDER_RES='1920x1080',TOTK_ASPECT='239:110',
                       TOTK_IPHONE_ASPECT_PATCH='1',TOTK_PCHTXT=str(tree/'build/iphone239.pchtxt'))
+    if experimental:
+        result['TOTK_FREE_AUTOBUILD_EXPORT'] = '1'
     return result
 
 
@@ -95,6 +111,7 @@ def main():
     p.add_argument('--build-number', type=int, default=27)
     p.add_argument('--app-only',action='store_true',help='prepare a device app bundle for direct signing and installation')
     p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: stable 4:3 narrow picture; iphone: static wide display')
+    p.add_argument('--experimental-free-autobuild',action='store_true',help='separate base-1.0.0 trial app; does not change com.willspain.totk')
     p.add_argument('--app-icon',type=Path,help='local square JPEG or PNG scaled into the iOS icon set; the source image is not copied into git')
     a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
     if a.build_number < 1: raise RuntimeError('build number must be positive')
@@ -122,7 +139,11 @@ def main():
     host=tree/('build/totk-native' if a.version=='v0' else f'build/totk-native-{a.version}')
     rewritten=tree/f'rewritten/{a.version}'; modules=gen/'modules';modules.mkdir(exist_ok=True)
     # Native iPad output must be patched into signed code on the Mac, never into executable pages on the device.
-    e=display_export_env(env,tree,modules,a.version,a.display)
+    if a.experimental_free_autobuild:
+        if 'FreeAutobuild' not in a.out.name:
+            raise RuntimeError('experimental output file name must contain FreeAutobuild')
+        a.app_name=experimental_free_autobuild(a.bundle_id,a.app_name,a.cloud_container,a.version)
+    e=display_export_env(env,tree,modules,a.version,a.display,a.experimental_free_autobuild)
     run([host,rewritten,'export-ios'],tree,logs/'export-ios.log',e)
     flags=subprocess.check_output([sys.executable,ios/'tools/gen_embed.py',rewritten,gen/'embed.S','--text-dir',modules,'main','subsdk0','sdk'],text=True,env=env).strip()
     # The app's sources use version-specific patch and generated runtime tables.

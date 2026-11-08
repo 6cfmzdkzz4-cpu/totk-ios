@@ -3,6 +3,7 @@
 #import <CoreHaptics/CoreHaptics.h>
 #include "simple_settings_ios.h"
 #include "totk_frame_cap.h"
+#include "free_autobuild.h"
 void runtime_ios_apply_frame_cap(void);
 
 @interface TOTKSettingsNavigation : UINavigationController <UIAdaptivePresentationControllerDelegate>
@@ -57,7 +58,7 @@ void runtime_ios_apply_frame_cap(void);
     (void)tableView;
     if(section==1)return @"30 and 60 are the only caps this build paces. 30 is the default and holds presents at 30 Hz, with the real-time frame step following that spacing. 60 uses the existing present-interval patch and is a ceiling, not a sustained rate. 90 and 120 are unavailable: the game's interval is a whole 60 Hz tick floored at 1, and frame-counted interface logic diverges above that. No 90 or 120 gameplay patch was added. The top-left counter is a separate display.";
     if(section==2)return @"Off by default. Applies on the next launch. Put a base 1.0.0 RomFS mod in this app's Files folder mods/, including manifest.tsv. The game checks every file against the installed base data and refuses symlinks and executable or cheat names. ExeFS, pchtxt and emulator cheats are not loaded. Turn this off to use the original files again. If a manifest stops launch, turn it off in the system Settings app for this app.";
-    if(section==3)return @"These rows are unavailable. Free Autobuild is three code writes, not a RomFS mod. iOS cannot change those instructions from this menu or on the next launch. A Mac export can include them only after the pinned 1.0.0 site check passes, and only in this experimental app. Infinite items has no base 1.0.0 site, so it cannot stop normal consumable use, spawn story items, or edit saves. This app does not import saves from com.willspain.totk and does not add health, currency, or combat cheats.";
+    if(section==3)return @"Free Autobuild applies on the next launch. Off runs the original three instructions. On runs the supplied NOP, MOV W8, WZR, and NOP in this app's executed code. It does not prove a Zonaite change. Infinite items is unavailable: no base 1.0.0 consumable site is known, and this does not spawn story items or edit saves. This app does not import saves from com.willspain.totk.";
     return self.supportsDeviceHaptics?@"Changes apply when you close settings.":@"Device haptics are unavailable on this device. Gyro changes apply when you close settings.";
 }
 - (void)selectFrameCap:(int)hz {
@@ -94,7 +95,19 @@ void runtime_ios_apply_frame_cap(void);
     return cell;
 }
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)path {
-    if(path.section==3)return [self unavailableCheatCell:path.row==0?@"Free Autobuild":@"Infinite items"];
+    if(path.section==3 && path.row==1)return [self unavailableCheatCell:@"Infinite items"];
+    if(path.section==3){
+        if(!free_autobuild_ready())return [self unavailableCheatCell:@"Free Autobuild"];
+        UITableViewCell *cell=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text=@"Free Autobuild";cell.selectionStyle=UITableViewCellSelectionStyleNone;
+        UISwitch *control=[UISwitch new];
+        control.on=[NSUserDefaults.standardUserDefaults boolForKey:@"TOTKFreeAutobuild"];
+        control.accessibilityLabel=@"Free Autobuild";
+        [control addAction:[UIAction actionWithHandler:^(__kindof UIAction *action){
+            (void)action;[NSUserDefaults.standardUserDefaults setBool:control.on forKey:@"TOTKFreeAutobuild"];
+        }] forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView=control;return cell;
+    }
     if(path.section==2){
         (void)tableView;
         UITableViewCell *cell=[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];

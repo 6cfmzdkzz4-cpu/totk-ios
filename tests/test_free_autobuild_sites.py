@@ -35,14 +35,46 @@ def nso(build_id: bytes, text: bytes) -> bytes:
 
 
 class FreeAutobuildSites(unittest.TestCase):
+    def test_veneer_preserves_the_original_or_runs_the_supplied_write(self):
+        compiler = __import__('shutil').which('clang') or __import__('shutil').which('cc')
+        if not compiler:
+            self.skipTest('A C compiler is required')
+        with tempfile.TemporaryDirectory() as folder:
+            binary = Path(folder) / 'veneer'
+            build = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror',
+                                    f'-I{ROOT / "games/totk/runtime"}',
+                                    str(ROOT / 'tests/test_free_autobuild_veneer.c'),
+                                    '-o', str(binary)], capture_output=True, text=True)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_experimental_export_cannot_replace_the_production_app(self):
+        import importlib.util
+        tools = ROOT / 'games/totk/ios/tools'
+        spec = importlib.util.spec_from_file_location('display_package_builder', tools / 'build_ipa.py')
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        with self.assertRaisesRegex(RuntimeError, 'com.willspain.totk'):
+            builder.experimental_free_autobuild('com.willspain.totk', 'Tears of the Kingdom', '', 'v0')
+        self.assertEqual(builder.experimental_free_autobuild(
+            'com.willspain.totk.freeautobuild', 'Tears of the Kingdom', '', 'v0'), 'TOTK Free Autobuild')
+        env = builder.display_export_env({'TOTK_FREE_AUTOBUILD_EXPORT': '1'}, Path('tree'), Path('modules'), 'v0', 'duo')
+        self.assertNotIn('TOTK_FREE_AUTOBUILD_EXPORT', env)
+        trial = builder.display_export_env({}, Path('tree'), Path('modules'), 'v0', 'duo', experimental=True)
+        self.assertEqual(trial['TOTK_FREE_AUTOBUILD_EXPORT'], '1')
+        for site in (0x1714820, 0x1717610, 0xd46270):
+            self.assertNotIn(site, sites.runtime_sites())
     def test_cheat_menu_stays_off_the_production_bundle_and_does_not_apply_writes(self):
         settings = (ROOT/'games/totk/ios/Sources/TOTKSettings.m').read_text()
         patches = (ROOT/'games/totk/runtime/game_patches.c').read_text()
         self.assertIn('com.willspain.totk.freeautobuild', settings)
         self.assertIn('experimentalCheats?4:3', settings)
-        self.assertIn('@"Free Autobuild":@"Infinite items"', settings)
-        self.assertIn('@"Unavailable"', settings)
-        self.assertNotIn('TOTKFreeAutobuild', settings)
+        self.assertIn('@"Infinite items"', settings)
+        self.assertIn('free_autobuild_ready()', settings)
+        self.assertIn('@"TOTKFreeAutobuild"', settings)
+        self.assertIn('Applies on the next launch', settings)
+        self.assertNotIn('0x1714820', (ROOT/'games/totk/runtime/game_patches.c').read_text())
         for site in ('0x1714820', '0x1717610', '0xd46270'):
             self.assertNotIn(site, patches.lower())
     def test_replacements_are_nop_and_mov_w8_wzr(self):
