@@ -1,7 +1,8 @@
 /* Experimental Free Autobuild veneer for base 1.0.0.
    The three supplied writes run from main's executed text. Off replays the
-   original instruction; on runs the supplied NOP or MOV W8, WZR. The menu
-   selects the flag for the next launch. Production images are left untouched. */
+   original instruction; on runs the supplied NOP or MOV W8, WZR. The isolated
+   trial starts on until its own switch is saved off. That off choice stays off.
+   Production images do not install the veneer. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -59,6 +60,23 @@ static inline void fa_sha256(const uint8_t *message, size_t length, uint8_t out[
     }
     uint32_t hs[8] = {h0,h1,h2,h3,h4,h5,h6,h7};
     for (int i = 0; i < 8; i++) { out[4*i]=(uint8_t)(hs[i]>>24); out[4*i+1]=(uint8_t)(hs[i]>>16); out[4*i+2]=(uint8_t)(hs[i]>>8); out[4*i+3]=(uint8_t)hs[i]; }
+}
+
+static inline int fa_hex_nibble(char digit) {
+    if (digit >= '0' && digit <= '9') return digit - '0';
+    if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+    if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+    return -1;
+}
+/* Index the characters. Do not add an integer to the string literal. */
+static inline int fa_parse_sha256(const char *hex, uint8_t out[32]) {
+    if (!hex) return 0;
+    for (int i = 0; i < 32; i++) {
+        int hi = fa_hex_nibble(hex[2 * i]), lo = fa_hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return hex[64] == 0;
 }
 
 static inline uint32_t fa_branch(uint64_t from, uint64_t to) {

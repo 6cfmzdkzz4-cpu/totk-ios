@@ -469,9 +469,7 @@ void free_autobuild_set(int enabled) { if (free_autobuild_flag) *free_autobuild_
 static int fa_hash_matches(const uint32_t words[3]) {
     uint8_t digest[32], expect[32];
     fa_sha256((const uint8_t *)words, 12, digest);
-    for (int i = 0; i < 32; i++) {
-        unsigned value; sscanf(FA_ORIGINAL_SHA256 + 2 * i, "%2x", &value); expect[i] = (uint8_t)value;
-    }
+    if (!fa_parse_sha256(FA_ORIGINAL_SHA256, expect)) return 0;
     return memcmp(digest, expect, 32) == 0;
 }
 static void free_autobuild_install(Module *m) {
@@ -513,7 +511,7 @@ static void free_autobuild_install(Module *m) {
     }
     free_autobuild_flag = m->base + data + FA_FLAG_OFFSET;
     free_autobuild_set(getenv("TOTK_FREE_AUTOBUILD") && strcmp(getenv("TOTK_FREE_AUTOBUILD"), "0"));
-    fprintf(stderr, "[totk] experimental Free Autobuild veneer %s; three executed sites, default off until the next launch asks for it\n",
+    fprintf(stderr, "[totk] experimental Free Autobuild veneer %s for this launch\n",
             *free_autobuild_flag ? "on" : "off");
 }
 

@@ -41,7 +41,7 @@ class FreeAutobuildSites(unittest.TestCase):
             self.skipTest('A C compiler is required')
         with tempfile.TemporaryDirectory() as folder:
             binary = Path(folder) / 'veneer'
-            build = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror',
+            build = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wstring-plus-int',
                                     f'-I{ROOT / "games/totk/runtime"}',
                                     str(ROOT / 'tests/test_free_autobuild_veneer.c'),
                                     '-o', str(binary)], capture_output=True, text=True)
@@ -77,7 +77,14 @@ class FreeAutobuildSites(unittest.TestCase):
         self.assertIn('@"Infinite items"', settings)
         self.assertIn('free_autobuild_ready()', settings)
         self.assertIn('@"TOTKFreeAutobuild"', settings)
-        self.assertIn('Applies on the next launch', settings)
+        self.assertIn('starts with Free Autobuild on', settings)
+        self.assertIn('stays off', settings)
+        launch = (ROOT/'games/totk/ios/Sources/main.m').read_text()
+        self.assertNotIn('@"TOTKFreeAutobuild":@NO', launch)
+        self.assertIn('defaults[@"TOTKFreeAutobuild"]=@YES', launch)
+        self.assertIn('unsetenv("TOTK_FREE_AUTOBUILD")', launch)
+        self.assertNotIn('default off', patches)
+        self.assertNotIn('FA_ORIGINAL_SHA256 +', patches)
         self.assertNotIn('0x1714820', (ROOT/'games/totk/runtime/game_patches.c').read_text())
         for site in ('0x1714820', '0x1717610', '0xd46270'):
             self.assertNotIn(site, patches.lower())

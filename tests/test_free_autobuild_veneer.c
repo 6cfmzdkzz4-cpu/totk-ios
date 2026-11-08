@@ -36,6 +36,10 @@ int main(void) {
     expect(fa_stub(stub, FA_NOP, site, at, data) == 0, "an unexpected instruction is refused");
     expect(strcmp(FA_ORIGINAL_SHA256, "8f89130628c3e9996afbecb2b6a646b508cef23375d4bad94b0b24dd1003704a") == 0,
            "pinned original hash");
+    uint8_t parsed[32];
+    expect(fa_parse_sha256(FA_ORIGINAL_SHA256, parsed) == 1, "parse pin");
+    expect(parsed[0] == 0x8f && parsed[31] == 0x4a, "pin endpoints");
+    expect(fa_parse_sha256("zz", parsed) == 0, "bad hex refused");
     uint8_t digest[32];
     fa_sha256((const uint8_t *)"abc", 3, digest);
     expect(memcmp(digest, "\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23\xb0\x03\x61\xa3\x96\x17\x7a\x9c\xb4\x10\xff\x61\xf2\x00\x15\xad", 32) == 0,
