@@ -233,6 +233,10 @@ void runtime_shortcut_help_toggle(void) {}
     NSString *font = [res stringByAppendingPathComponent:@"font"]; setenv("TOTK_FONT_DIR",font.fileSystemRepresentation,1);
     // Same player environment as the Mac launcher (app/launcher.m); the bundle is read-only, so state goes to Documents.
     setenv("TOTK_PROFILE_DIR",[docs stringByAppendingPathComponent:@"save"].fileSystemRepresentation,1);
+    /* Same command file as the Mac launcher. An empty file does nothing; appending "flag mask_draw 1" records one scene frame. */
+    NSString *commands = [docs stringByAppendingPathComponent:@"input.txt"];
+    if (![fm fileExistsAtPath:commands]) [fm createFileAtPath:commands contents:[NSData data] attributes:nil];
+    setenv("TOTK_INPUT_FILE", commands.fileSystemRepresentation, 0);
     setenv("TOTK_GAME_SLOT_DIR",[docs stringByAppendingPathComponent:@"game-slot"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PROOF_DIR",docs.fileSystemRepresentation,1);   // hash the 17 GB RomFS once, not on every launch
     for (NSString *name in @[@"TOTK_GPU_ALLOW_SUBMIT",@"TOTK_GPU_WIDEN",@"TOTK_GPU_BLOCKRT",@"TOTK_GPU_MIDCLEAR"]) setenv(name.UTF8String,"1",1);

@@ -2291,6 +2291,8 @@ static int diag_shader_prefix_matches(const char *key, uint64_t value) {
     char prefix[17]; snprintf(prefix, sizeof prefix, "%016llx", (unsigned long long)value);
     return key && !strncmp(key, prefix, 16);
 }
+static _Atomic int g_mask_frames;
+static _Atomic uint64_t g_mask_frame;
 void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "arg_epoch")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_on, v != 0); MLOG("[flag] arg_epoch = %d", v != 0); return; }
     if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
@@ -2355,6 +2357,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
+    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); MLOG("[flag] mask_draw = %d (one scene frame: shader, scissor, wrap, border; sampling unchanged)", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -5343,6 +5346,11 @@ static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void
     if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].view && g_treg[tid].view_ser == g_ser_gen && (!g_treg[tid].view_pkg || g_treg[tid].view_dirty == treg_stamp(g_treg[tid].view_pkg))) { if (out) *out = g_treg[tid].view; return g_treg[tid].view_rid; }
     id<MTLTexture> t = tex_by_id(tid); if (out) *out = (__bridge void *)t; return t ? t.gpuResourceID._impl : 0;
 }
+/* NVN wrap modes (nvn.h) and the same host mapping Ryujinx uses where Vulkan has no exact mode:
+   0 CLAMP and 7 CLAMP_TO_EDGE -> clamp to edge (true GL clamp, which also consults the border, has no Metal mode);
+   2 MIRROR_CLAMP and 3 MIRROR_CLAMP_TO_EDGE -> mirror clamp to edge;
+   4 MIRROR_CLAMP_TO_BORDER and 5 CLAMP_TO_BORDER -> clamp to border (mirror is not available);
+   1 REPEAT, 6 MIRRORED_REPEAT. Do not swap 0 onto the border: that is not the NVN mode, and it is not this mapping. */
 static MTLSamplerAddressMode wrapm(int w) {
     switch (w) { case 0: case 7: return MTLSamplerAddressModeClampToEdge; case 1: return MTLSamplerAddressModeRepeat;
         case 3: case 2: return MTLSamplerAddressModeMirrorClampToEdge; case 5: case 4: return MTLSamplerAddressModeClampToBorderColor;
@@ -9460,6 +9468,46 @@ void mtl_shader_miss_window(char *buf, size_t cap) {
     if (over && o + 32 < cap) snprintf(buf + o, cap - o, "%s+%llu more", o ? "; " : "", (unsigned long long)over);
     pthread_mutex_unlock(&g_smiss_mu);
 }
+/* Opt-in, one scene frame: fragment key, whether the scissor covers the color target, and any fragment
+   sampler that is not plain repeat with a zero border and zero LOD bias. No texels and no shader bytes.
+   Sampling is unchanged. Arm with TOTK_INPUT_FILE "flag mask_draw 1" while the red edge is on screen. */
+static void mask_draw_note(NvProg *pr) {
+    if (atomic_load(&g_mask_frames) <= 0 || !pr || !pr->sh[1] || !pr->sh[1]->key[0]) return;
+    if (!R.has_rt || !R.rt.n || !R.rt.color[0] || R.rt.color[0]->d.width < 640) return;
+    uint64_t fr = atomic_load(&g_cur_frame);
+    static int lines;
+    if (fr != atomic_load(&g_mask_frame)) {
+        if (atomic_load(&g_mask_frame) && atomic_fetch_sub(&g_mask_frames, 1) - 1 <= 0) return;
+        atomic_store(&g_mask_frame, fr); lines = 48;
+        MLOG("[mask-draw] frame %llu", (unsigned long long)fr);
+    }
+    if (lines <= 0) return;
+    lines--;
+    const tex_t *ct = R.rt.color[0];
+    int full = !R.has_sc || (R.sc.x <= 0 && R.sc.y <= 0 && R.sc.w >= (int)ct->d.width && R.sc.h >= (int)ct->d.height);
+    char extra[700]; size_t o = 0; extra[0] = 0; int n = 0;
+    registry_lock();
+    for (int r = 0; r < 16 && n < 4 && o + 160 < sizeof extra; r++) {
+        uint64_t th = S.tex[1][r], sh = S.samp[1][r];
+        int sid = (int)(sh >> 20); if (!sid) sid = (int)(th >> 20);
+        int tid = (int)(th & 0xfffff);
+        if (sid <= 0 || sid >= g_nsreg || !g_sreg_ok[sid]) continue;
+        samp_par p = g_sreg[sid];
+        int plain = p.ws == NVN_WRAP_MODE_REPEAT && p.wt == NVN_WRAP_MODE_REPEAT && p.wr == NVN_WRAP_MODE_REPEAT && !p.cmp_mode
+            && p.border[0] == 0 && p.border[1] == 0 && p.border[2] == 0 && p.border[3] == 0 && p.lod_bias == 0;
+        if (plain) continue;
+        uint32_t tw = 0, thh = 0, fmt = 0;
+        if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { tw = g_treg[tid].t.d.width; thh = g_treg[tid].t.d.height; fmt = g_treg[tid].t.d.format; }
+        o += snprintf(extra + o, sizeof extra - o, " r%d wrap=%u/%u/%u bias=%.3g border=%.3g,%.3g,%.3g,%.3g tex=%ux%u fmt=%#x",
+            r, p.ws, p.wt, p.wr, p.lod_bias, p.border[0], p.border[1], p.border[2], p.border[3], tw, thh, fmt);
+        n++;
+    }
+    registry_unlock();
+    MLOG("[mask-draw] F%llu fs=%.16s tgt=%ux%u fmt=%#x sc=%d,%d,%d,%d full=%d%s",
+        (unsigned long long)fr, pr->sh[1]->key, ct->d.width, ct->d.height, ct->d.format,
+        R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height,
+        full, extra[0] ? extra : " samp=repeat");
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
@@ -9589,6 +9637,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS))
         RED_ONCE(70, "TOTK: logic op %u / alpha test %u not implemented on Metal (drawn without it)", S.color.logic_op, S.color.alpha_func);
     if (S.render_disabled || S.raster_discard) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
+    mask_draw_note(pr);
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_draw_skip[5]++; return; }
     if (exp_skip_fs(pr)) return;   // TOTK_EXP_SKIP_FS (measurement only)
     // 续用的通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
