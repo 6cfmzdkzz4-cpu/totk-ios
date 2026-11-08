@@ -9417,12 +9417,55 @@ static int mfxup_draw(NvProg *pr) {
     return 0;
 }
 #include "nvn_cube_group.h"
+/* Missing-shader draws stay skipped. This only names, per 300-frame report, which key was skipped and the color
+   target it would have written. Eight keys; further keys add to the overflow count. No shader bytes, no texture dump. */
+#define SMISS_SLOTS 8
+typedef struct { char key[17]; uint32_t w, h, fmt; uint64_t draws, gated, seen_draws, seen_gated; uint8_t stage, varied; } smiss_slot;
+static smiss_slot g_smiss[SMISS_SLOTS];
+static uint64_t g_smiss_over, g_smiss_over_seen;
+static pthread_mutex_t g_smiss_mu = PTHREAD_MUTEX_INITIALIZER;
+static void shader_miss_note(NvProg *pr) {
+    if (!pr) { pthread_mutex_lock(&g_smiss_mu); g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); return; }
+    int st = (pr->missing & 2) && pr->key[1] ? 1 : (pr->missing & 1) && pr->key[0] ? 0 : pr->miss_has[1] && pr->key[1] ? 1 : pr->miss_has[0] && pr->key[0] ? 0 : pr->key[1] ? 1 : pr->key[0] ? 0 : -1;
+    if (st < 0) { pthread_mutex_lock(&g_smiss_mu); g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); return; }
+    const char *utf = pr->key[st].UTF8String; char key[17]; memset(key, 0, sizeof key); if (utf) memcpy(key, utf, strnlen(utf, 16));
+    uint32_t w = 0, h = 0, fmt = 0;
+    if (R.has_rt && R.rt.color[0]) { w = R.rt.color[0]->d.width; h = R.rt.color[0]->d.height; fmt = R.rt.color[0]->d.format; }
+    int gated = S.render_disabled != 0;
+    pthread_mutex_lock(&g_smiss_mu);
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < SMISS_SLOTS; i++) {
+        if (!g_smiss[i].key[0]) { if (free_slot < 0) free_slot = i; continue; }
+        if (g_smiss[i].stage == (uint8_t)st && !memcmp(g_smiss[i].key, key, 16)) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (free_slot < 0) { g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); return; }
+        slot = free_slot; memcpy(g_smiss[slot].key, key, 16); g_smiss[slot].stage = (uint8_t)st; g_smiss[slot].w = w; g_smiss[slot].h = h; g_smiss[slot].fmt = fmt;
+    } else if (g_smiss[slot].w != w || g_smiss[slot].h != h || g_smiss[slot].fmt != fmt) g_smiss[slot].varied = 1;
+    g_smiss[slot].draws++; if (gated) g_smiss[slot].gated++;
+    pthread_mutex_unlock(&g_smiss_mu);
+}
+void mtl_shader_miss_window(char *buf, size_t cap) {
+    if (!buf || !cap) return; buf[0] = 0;
+    pthread_mutex_lock(&g_smiss_mu);
+    size_t o = 0;
+    for (int i = 0; i < SMISS_SLOTS; i++) {
+        smiss_slot *s = &g_smiss[i]; uint64_t d = s->draws - s->seen_draws, g = s->gated - s->seen_gated;
+        s->seen_draws = s->draws; s->seen_gated = s->gated;
+        if (!d || o + 120 >= cap) continue;
+        o += snprintf(buf + o, cap - o, "%s%s %.16s draws=%llu visible=%llu gated=%llu target=%ux%u fmt=%#x%s",
+            o ? "; " : "", s->stage ? "ps" : "vs", s->key, (unsigned long long)d, (unsigned long long)(d - g), (unsigned long long)g, s->w, s->h, s->fmt, s->varied ? " size-varied" : "");
+    }
+    uint64_t over = g_smiss_over - g_smiss_over_seen; g_smiss_over_seen = g_smiss_over;
+    if (over && o + 32 < cap) snprintf(buf + o, cap - o, "%s+%llu more", o ? "; " : "", (unsigned long long)over);
+    pthread_mutex_unlock(&g_smiss_mu);
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
-    if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
+    if (pr && pr->missing) { shader_miss_note(pr); g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
-    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
+    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { shader_miss_note(pr); g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
