@@ -65,10 +65,33 @@ class FreeAutobuildSites(unittest.TestCase):
         self.assertEqual(trial['TOTK_FREE_AUTOBUILD_EXPORT'], '1')
         for site in (0x1714820, 0x1717610, 0xd46270):
             self.assertNotIn(site, sites.runtime_sites())
-        driver = (ROOT/'tools/ios_build.py').read_text()
-        self.assertIn('required = 25 if cached', driver)
-        self.assertIn('--experimental-free-autobuild', driver)
-        self.assertIn('com.willspain.totk.freeautobuild', driver)
+        driver_source = (ROOT/'tools/ios_build.py').read_text()
+        self.assertIn('required = 25 if cached', driver_source)
+
+    def test_driver_app_path_passes_the_packager_preflight(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ios_personal_build', ROOT/'tools/ios_build.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        out = Path('dist/TOTK-FreeAutobuild.ipa')
+        personal = driver.experimental_personal_app(Path('work'), out, True)
+        self.assertEqual(personal.name, 'TOTK-FreeAutobuild.app')
+        self.assertNotEqual(personal.name, driver.APP_FILENAME)
+        self.assertEqual(driver.experimental_personal_app(Path('work'), Path('dist/game.ipa'), False).name, driver.APP_FILENAME)
+        script = ROOT/'games/totk/ios/tools/build_ipa.py'
+        args = driver.ios_package_arguments(Path('work/totk'), personal, Path('work/logs'),
+                                            'com.willspain.totk.freeautobuild', 'duo', 30, '', True)
+        ok = subprocess.run([sys.executable, str(script), *args, '--preflight'], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn('display TOTK Free Autobuild', ok.stdout)
+        self.assertIn('TOTK-FreeAutobuild.app', ok.stdout)
+        spaced = personal.with_name('TOTK Free Autobuild.app')
+        bad = subprocess.run([sys.executable, str(script), '--tree', 'work/totk', '--out', str(spaced),
+                              '--version', 'v0', '--logs', 'work/logs', '--bundle-id', 'com.willspain.totk.freeautobuild',
+                              '--display', 'duo', '--app-only', '--experimental-free-autobuild', '--preflight'],
+                             capture_output=True, text=True)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn('FreeAutobuild', bad.stderr)
     def test_cheat_menu_stays_off_the_production_bundle_and_does_not_apply_writes(self):
         settings = (ROOT/'games/totk/ios/Sources/TOTKSettings.m').read_text()
         patches = (ROOT/'games/totk/runtime/game_patches.c').read_text()

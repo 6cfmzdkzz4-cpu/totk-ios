@@ -112,11 +112,23 @@ def main():
     p.add_argument('--app-only',action='store_true',help='prepare a device app bundle for direct signing and installation')
     p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: stable 4:3 narrow picture; iphone: static wide display')
     p.add_argument('--experimental-free-autobuild',action='store_true',help='separate base-1.0.0 trial app; does not change com.willspain.totk')
+    p.add_argument('--preflight',action='store_true',help='check the trial output name and identity, then exit before compiling')
     p.add_argument('--app-icon',type=Path,help='local square JPEG or PNG scaled into the iOS icon set; the source image is not copied into git')
-    a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
+    a=p.parse_args(); out=Path(a.out)
     if a.build_number < 1: raise RuntimeError('build number must be positive')
-    narrow=narrow_profile(a.version,a.display)
     if out.suffix.lower()!=('.app' if a.app_only else '.ipa'): raise RuntimeError('iOS output has the wrong extension')
+    if a.experimental_free_autobuild:
+        if 'FreeAutobuild' not in out.name:
+            raise RuntimeError('experimental output file name must contain FreeAutobuild')
+        a.app_name=experimental_free_autobuild(a.bundle_id,a.app_name,a.cloud_container,a.version)
+        if a.preflight:
+            print(f'preflight ok: display {a.app_name}; package {out.name}')
+            return
+    elif a.preflight:
+        print(f'preflight ok: package {out.name}')
+        return
+    tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=out.resolve()
+    narrow=narrow_profile(a.version,a.display)
     env=dict(os.environ,DEVELOPER_DIR=developer_dir())
     sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],env=env,text=True).strip()
     subprocess.run(['xcodebuild','-version'],env=env,check=True,stdout=subprocess.DEVNULL)
@@ -139,10 +151,6 @@ def main():
     host=tree/('build/totk-native' if a.version=='v0' else f'build/totk-native-{a.version}')
     rewritten=tree/f'rewritten/{a.version}'; modules=gen/'modules';modules.mkdir(exist_ok=True)
     # Native iPad output must be patched into signed code on the Mac, never into executable pages on the device.
-    if a.experimental_free_autobuild:
-        if 'FreeAutobuild' not in a.out.name:
-            raise RuntimeError('experimental output file name must contain FreeAutobuild')
-        a.app_name=experimental_free_autobuild(a.bundle_id,a.app_name,a.cloud_container,a.version)
     e=display_export_env(env,tree,modules,a.version,a.display,a.experimental_free_autobuild)
     run([host,rewritten,'export-ios'],tree,logs/'export-ios.log',e)
     flags=subprocess.check_output([sys.executable,ios/'tools/gen_embed.py',rewritten,gen/'embed.S','--text-dir',modules,'main','subsdk0','sdk'],text=True,env=env).strip()

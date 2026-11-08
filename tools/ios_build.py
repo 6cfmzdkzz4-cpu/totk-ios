@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO))
 import build_app as upstream
 
 APP_FILENAME = f"{upstream.APP_NAME}.app"
+EXPERIMENTAL_APP_FILENAME = "TOTK-FreeAutobuild.app"
 
 # This exact permission-metadata variant is unused by the native runtime. It
 # carries no valid Nintendo ACID signature. All executable and RomFS gates stay
@@ -76,8 +77,43 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def experimental_personal_app(work: Path, out: Path, experimental: bool) -> Path:
+    """The .app path passed to the packager. An IPA is packed from this file afterward."""
+    if out.suffix.lower() == ".app":
+        return out
+    filename = EXPERIMENTAL_APP_FILENAME if experimental else APP_FILENAME
+    return work / "personal" / filename
+
+
+def ios_package_arguments(tree: Path, personal_app: Path, logs: Path, bundle_id: str, display: str, build_number: int,
+                          cloud_container: str, experimental: bool, app_icon: Path | None = None) -> list[str]:
+    """Arguments after the packager script. The trial .app name keeps the contiguous FreeAutobuild token."""
+    args = ["--tree", str(tree), "--out", str(personal_app), "--version", "v0", "--logs", str(logs),
+            "--bundle-id", bundle_id, "--display", display, "--build-number", str(build_number),
+            "--cloud-container", cloud_container, "--app-only"]
+    if experimental:
+        args.append("--experimental-free-autobuild")
+    if app_icon:
+        args.extend(["--app-icon", str(app_icon)])
+    return args
+
+
+def validate_experimental_identity(args):
+    """Reject a trial that would reuse the production bundle, iCloud container, or app filename."""
+    if not args.experimental_free_autobuild:
+        return
+    if args.bundle_id != "com.willspain.totk.freeautobuild" or "FreeAutobuild" not in args.out.name or args.out.name == APP_FILENAME:
+        raise upstream.BuildError("experimental Free Autobuild requires --bundle-id com.willspain.totk.freeautobuild and an output name containing FreeAutobuild")
+    if args.cloud_container:
+        raise upstream.BuildError("experimental Free Autobuild must not use a CloudKit container")
+    personal = experimental_personal_app(args.work, args.out, True)
+    if "FreeAutobuild" not in personal.name or personal.name == APP_FILENAME:
+        raise upstream.BuildError("experimental Free Autobuild intermediate app name must contain FreeAutobuild")
+
+
 def validate_options(args):
     """Reject ambiguous identity, unsupported inputs, and unintended install modes."""
+    validate_experimental_identity(args)
     if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", args.bundle_id):
         raise upstream.BuildError("--bundle-id must be a reverse-domain application identifier")
     if args.cloud_container and not re.fullmatch(r"iCloud\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", args.cloud_container):
@@ -204,20 +240,10 @@ def main(argv=None):
     ensure_translator(tree, args, logs, env)
     upstream.step_shaders(tree, logs, version="v0")
     upstream.step_binary(tree, args.game, args.keys, env, logs, version="v0")
-    if args.experimental_free_autobuild:
-        if args.bundle_id != "com.willspain.totk.freeautobuild" or "FreeAutobuild" not in args.out.name:
-            raise upstream.BuildError("experimental Free Autobuild requires --bundle-id com.willspain.totk.freeautobuild and an output name containing FreeAutobuild")
-        if args.cloud_container:
-            raise upstream.BuildError("experimental Free Autobuild must not use a CloudKit container")
-    personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal" / (
-        "TOTK Free Autobuild.app" if args.experimental_free_autobuild else APP_FILENAME)
-    ios_cmd = [tree / ".venv/bin/python", "ios/tools/build_ipa.py", "--tree", tree, "--out", personal_app,
-               "--version", "v0", "--logs", logs, "--bundle-id", args.bundle_id, "--display", args.display,
-               "--build-number", str(args.build_number), "--cloud-container", args.cloud_container, "--app-only"]
-    if args.experimental_free_autobuild:
-        ios_cmd.append("--experimental-free-autobuild")
-    if args.app_icon:
-        ios_cmd.extend(["--app-icon", str(args.app_icon)])
+    personal_app = experimental_personal_app(args.work, args.out, args.experimental_free_autobuild)
+    ios_cmd = [str(tree / ".venv/bin/python"), "ios/tools/build_ipa.py",
+               *ios_package_arguments(tree, personal_app, logs, args.bundle_id, args.display, args.build_number,
+                                      args.cloud_container, args.experimental_free_autobuild, args.app_icon)]
     run(ios_cmd, "build-ios.log")
     receipt["compiled"] = True
     receipt["ios_dependencies"] = json.loads((tree / "build/ios-deps/manifest.json").read_text())
@@ -231,10 +257,11 @@ def main(argv=None):
         if payload.parent.exists():
             shutil.rmtree(payload.parent)
         payload.mkdir(parents=True)
-        copied = subprocess.run(["cp", "-cR", str(personal_app), str(payload / APP_FILENAME)], capture_output=True)
+        payload_name = personal_app.name
+        copied = subprocess.run(["cp", "-cR", str(personal_app), str(payload / payload_name)], capture_output=True)
         if copied.returncode:
-            shutil.rmtree(payload / APP_FILENAME, ignore_errors=True)
-            shutil.copytree(personal_app, payload / APP_FILENAME)
+            shutil.rmtree(payload / payload_name, ignore_errors=True)
+            shutil.copytree(personal_app, payload / payload_name)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.unlink(missing_ok=True)
         upstream.run(["zip", "-qry", "-0", args.out, "Payload"], logs / "pack-ipa.log", cwd=payload.parent)
