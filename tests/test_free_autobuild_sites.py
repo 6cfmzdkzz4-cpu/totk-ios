@@ -52,6 +52,7 @@ class FreeAutobuildSites(unittest.TestCase):
     def test_experimental_export_cannot_replace_the_production_app(self):
         import importlib.util
         tools = ROOT / 'games/totk/ios/tools'
+        sys.path.insert(0, str(tools))
         spec = importlib.util.spec_from_file_location('display_package_builder', tools / 'build_ipa.py')
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
@@ -66,7 +67,9 @@ class FreeAutobuildSites(unittest.TestCase):
         for site in (0x1714820, 0x1717610, 0xd46270):
             self.assertNotIn(site, sites.runtime_sites())
         driver_source = (ROOT/'tools/ios_build.py').read_text()
-        self.assertIn('required = 25 if cached', driver_source)
+        self.assertIn('CACHED_MIN_FREE_GIB = 12', driver_source)
+        self.assertIn('free_requirement_gib(cached, ipa, resolve_min_free(args))', driver_source)
+        self.assertNotIn('required = 25 if cached', driver_source)
 
     def test_driver_app_path_passes_the_packager_preflight(self):
         import importlib.util
