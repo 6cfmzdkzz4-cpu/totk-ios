@@ -2357,7 +2357,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
-    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); MLOG("[flag] mask_draw = %d (one scene frame: shader, scissor, wrap, border; sampling unchanged; append again after a lightroot for the unlit comparison)", v != 0); return; }
+    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); MLOG("[flag] mask_draw = %d (one scene frame; 48 detail lines, then every fragment key on that target; sampling unchanged. Hide one key with flag skipfs_<16 hex> 1 and clear it with 0)", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -9469,26 +9469,45 @@ void mtl_shader_miss_window(char *buf, size_t cap) {
     pthread_mutex_unlock(&g_smiss_mu);
 }
 __attribute__((weak)) float dm_bright_k(void);
-/* Opt-in, one scene frame: fragment key, whether the scissor covers the color target, and any fragment
-   sampler that is not plain repeat with a zero border and zero LOD bias. No texels and no shader bytes.
-   Sampling is unchanged. Arm with TOTK_INPUT_FILE "flag mask_draw 1" while the red edge is on screen. */
+/* One scene frame. The first 48 draws keep sampler, swizzle, and blend detail. Every fragment key on that
+   target is counted, including draws after those 48 lines. No texels and no shader bytes. Sampling is unchanged. */
+static struct { char key[17]; unsigned n; } g_mask_keys[64];
+static int g_mask_nkeys, g_mask_extra;
+static unsigned g_mask_draws;
+static void mask_keys_flush(uint64_t fr) {
+    if (!g_mask_draws) return;
+    MLOG("[mask-draw] keys F%llu draws=%u unique=%d omitted=%d", (unsigned long long)fr, g_mask_draws, g_mask_nkeys, g_mask_extra);
+    for (int i = 0; i < g_mask_nkeys; i++) MLOG("[mask-draw] key %.16s x%u", g_mask_keys[i].key, g_mask_keys[i].n);
+    g_mask_nkeys = 0; g_mask_extra = 0; g_mask_draws = 0;
+}
+static void mask_key_add(const char *key) {
+    g_mask_draws++;
+    for (int i = 0; i < g_mask_nkeys; i++) if (!strncmp(g_mask_keys[i].key, key, 16)) { g_mask_keys[i].n++; return; }
+    if (g_mask_nkeys >= 64) { g_mask_extra++; return; }
+    snprintf(g_mask_keys[g_mask_nkeys].key, sizeof g_mask_keys[g_mask_nkeys].key, "%.16s", key);
+    g_mask_keys[g_mask_nkeys].n = 1; g_mask_nkeys++;
+}
 static void mask_draw_note(NvProg *pr) {
     if (atomic_load(&g_mask_frames) <= 0 || !pr || !pr->sh[1] || !pr->sh[1]->key[0]) return;
     if (!R.has_rt || !R.rt.n || !R.rt.color[0] || R.rt.color[0]->d.width < 640) return;
     uint64_t fr = atomic_load(&g_cur_frame);
     static int lines;
     if (fr != atomic_load(&g_mask_frame)) {
-        if (atomic_load(&g_mask_frame) && atomic_fetch_sub(&g_mask_frames, 1) - 1 <= 0) return;
+        uint64_t prev = atomic_load(&g_mask_frame);
+        if (prev) mask_keys_flush(prev);
+        else { g_mask_nkeys = 0; g_mask_extra = 0; g_mask_draws = 0; }
+        if (prev && atomic_fetch_sub(&g_mask_frames, 1) - 1 <= 0) return;
         atomic_store(&g_mask_frame, fr); lines = 48;
         MLOG("[mask-draw] frame %llu bright=%.3f", (unsigned long long)fr, dm_bright_k());
     }
+    mask_key_add(pr->sh[1]->key);
     if (lines <= 0) return;
     lines--;
     const tex_t *ct = R.rt.color[0];
     int full = !R.has_sc || (R.sc.x <= 0 && R.sc.y <= 0 && R.sc.w >= (int)ct->d.width && R.sc.h >= (int)ct->d.height);
-    char extra[700]; size_t o = 0; extra[0] = 0; int n = 0;
+    char extra[900]; size_t o = 0; extra[0] = 0; int n = 0;
     registry_lock();
-    for (int r = 0; r < 16 && n < 4 && o + 160 < sizeof extra; r++) {
+    for (int r = 0; r < 16 && n < 4 && o + 180 < sizeof extra; r++) {
         uint64_t th = S.tex[1][r], sh = S.samp[1][r];
         int sid = (int)(sh >> 20); if (!sid) sid = (int)(th >> 20);
         int tid = (int)(th & 0xfffff);
@@ -9497,17 +9516,24 @@ static void mask_draw_note(NvProg *pr) {
         int plain = p.ws == NVN_WRAP_MODE_REPEAT && p.wt == NVN_WRAP_MODE_REPEAT && p.wr == NVN_WRAP_MODE_REPEAT && !p.cmp_mode
             && p.border[0] == 0 && p.border[1] == 0 && p.border[2] == 0 && p.border[3] == 0 && p.lod_bias == 0;
         if (plain) continue;
-        uint32_t tw = 0, thh = 0, fmt = 0;
-        if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { tw = g_treg[tid].t.d.width; thh = g_treg[tid].t.d.height; fmt = g_treg[tid].t.d.format; }
-        o += snprintf(extra + o, sizeof extra - o, " r%d wrap=%u/%u/%u bias=%.3g border=%.3g,%.3g,%.3g,%.3g tex=%ux%u fmt=%#x",
-            r, p.ws, p.wt, p.wr, p.lod_bias, p.border[0], p.border[1], p.border[2], p.border[3], tw, thh, fmt);
+        uint32_t tw = 0, thh = 0, fmt = 0, sr = 0, sg = 0, sb = 0, sa = 0, vfmt = 0;
+        if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
+            const treg_t *tr = &g_treg[tid];
+            tw = tr->t.d.width; thh = tr->t.d.height; fmt = tr->t.d.format;
+            sr = tr->t.d.swizzle_r; sg = tr->t.d.swizzle_g; sb = tr->t.d.swizzle_b; sa = tr->t.d.swizzle_a;
+            if (tr->has_v && tr->v.set_swizzle) { sr = tr->v.swz[0]; sg = tr->v.swz[1]; sb = tr->v.swz[2]; sa = tr->v.swz[3]; }
+            if (tr->has_v && tr->v.set_format) vfmt = tr->v.format;
+        }
+        o += snprintf(extra + o, sizeof extra - o, " r%d wrap=%u/%u/%u bias=%.3g border=%.3g,%.3g,%.3g,%.3g tex=%ux%u fmt=%#x swz=%u%u%u%u vfmt=%#x",
+            r, p.ws, p.wt, p.wr, p.lod_bias, p.border[0], p.border[1], p.border[2], p.border[3], tw, thh, fmt, sr, sg, sb, sa, vfmt);
         n++;
     }
     registry_unlock();
-    MLOG("[mask-draw] F%llu fs=%.16s tgt=%ux%u fmt=%#x sc=%d,%d,%d,%d full=%d%s",
+    MLOG("[mask-draw] F%llu fs=%.16s tgt=%ux%u fmt=%#x sc=%d,%d,%d,%d full=%d blend=%#x %u,%u,%u/%u,%u,%u%s",
         (unsigned long long)fr, pr->sh[1]->key, ct->d.width, ct->d.height, ct->d.format,
         R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height,
-        full, extra[0] ? extra : " samp=repeat");
+        full, S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb, S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
+        extra[0] ? extra : " samp=repeat");
 }
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
