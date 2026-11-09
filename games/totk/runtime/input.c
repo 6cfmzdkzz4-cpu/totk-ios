@@ -1,5 +1,6 @@
 /* Native keyboard and macOS gamepad backed full-key controller. State ABI follows libnx HID. */
 #include "runtime.h"
+#include "input_file_start.c"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -196,7 +197,8 @@ static void *input_file(void *arg) {
     }
     fclose(f); return NULL;
 }
-__attribute__((constructor)) static void input_file_start(void) {
-    const char *e = getenv("TOTK_INPUT_FILE"); if (!e || !*e) return;
-    pthread_t t; if (pthread_create(&t, NULL, input_file, (void *)e)) runtime_fail("diagnostic input thread"); pthread_detach(t);
+void runtime_input_file_start(void) {
+    input_file_ensure_started(getenv("TOTK_INPUT_FILE"), input_file, runtime_fail);
 }
+/* Mac: the launcher execs this process with TOTK_INPUT_FILE already set. iOS sets it later and calls again. */
+__attribute__((constructor)) static void input_file_start(void) { runtime_input_file_start(); }

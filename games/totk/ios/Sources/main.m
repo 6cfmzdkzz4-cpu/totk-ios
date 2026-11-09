@@ -237,6 +237,7 @@ void runtime_shortcut_help_toggle(void) {}
     NSString *commands = [docs stringByAppendingPathComponent:@"input.txt"];
     if (![fm fileExistsAtPath:commands]) [fm createFileAtPath:commands contents:[NSData data] attributes:nil];
     setenv("TOTK_INPUT_FILE", commands.fileSystemRepresentation, 0);
+    runtime_input_file_start();   /* constructors already ran, before this variable existed */
     setenv("TOTK_GAME_SLOT_DIR",[docs stringByAppendingPathComponent:@"game-slot"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PROOF_DIR",docs.fileSystemRepresentation,1);   // hash the 17 GB RomFS once, not on every launch
     for (NSString *name in @[@"TOTK_GPU_ALLOW_SUBMIT",@"TOTK_GPU_WIDEN",@"TOTK_GPU_BLOCKRT",@"TOTK_GPU_MIDCLEAR"]) setenv(name.UTF8String,"1",1);

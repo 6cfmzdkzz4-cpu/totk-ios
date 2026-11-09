@@ -2357,7 +2357,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
-    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); MLOG("[flag] mask_draw = %d (one scene frame: shader, scissor, wrap, border; sampling unchanged)", v != 0); return; }
+    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); MLOG("[flag] mask_draw = %d (one scene frame: shader, scissor, wrap, border; sampling unchanged; append again after a lightroot for the unlit comparison)", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -9468,6 +9468,7 @@ void mtl_shader_miss_window(char *buf, size_t cap) {
     if (over && o + 32 < cap) snprintf(buf + o, cap - o, "%s+%llu more", o ? "; " : "", (unsigned long long)over);
     pthread_mutex_unlock(&g_smiss_mu);
 }
+__attribute__((weak)) float dm_bright_k(void);
 /* Opt-in, one scene frame: fragment key, whether the scissor covers the color target, and any fragment
    sampler that is not plain repeat with a zero border and zero LOD bias. No texels and no shader bytes.
    Sampling is unchanged. Arm with TOTK_INPUT_FILE "flag mask_draw 1" while the red edge is on screen. */
@@ -9479,7 +9480,7 @@ static void mask_draw_note(NvProg *pr) {
     if (fr != atomic_load(&g_mask_frame)) {
         if (atomic_load(&g_mask_frame) && atomic_fetch_sub(&g_mask_frames, 1) - 1 <= 0) return;
         atomic_store(&g_mask_frame, fr); lines = 48;
-        MLOG("[mask-draw] frame %llu", (unsigned long long)fr);
+        MLOG("[mask-draw] frame %llu bright=%.3f", (unsigned long long)fr, dm_bright_k());
     }
     if (lines <= 0) return;
     lines--;
