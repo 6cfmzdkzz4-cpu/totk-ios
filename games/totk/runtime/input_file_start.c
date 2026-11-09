@@ -1,3 +1,4 @@
+#include "input_file_start.h"
 /* Start the diagnostic command thread once the path is known.
    The Mac child is exec'd with TOTK_INPUT_FILE already set, so a constructor can start it.
    iOS sets the variable later, in didFinishLaunching. A call before the path exists must not

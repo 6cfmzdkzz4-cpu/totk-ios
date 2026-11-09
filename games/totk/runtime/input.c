@@ -1,6 +1,6 @@
 /* Native keyboard and macOS gamepad backed full-key controller. State ABI follows libnx HID. */
 #include "runtime.h"
-#include "input_file_start.c"
+#include "input_file_start.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif

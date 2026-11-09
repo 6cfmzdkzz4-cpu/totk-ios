@@ -31,6 +31,7 @@ class ShortcutStatus(unittest.TestCase):
                            str(ROOT / 'tests/shortcut_output_fixture.c'),
                            str(gfx / 'totk_mfx.m'), str(gfx / 'totk_mfx_up.m'),
                            str(gfx / 'fps_overlay.c'),
+                           str(ROOT / 'games/totk/runtime/input_file_start.c'),
                            '-framework', 'Cocoa', '-framework', 'Metal',
                            '-framework', 'MetalFX', '-framework', 'QuartzCore',
                            '-framework', 'CoreVideo', '-o', str(executable)]
