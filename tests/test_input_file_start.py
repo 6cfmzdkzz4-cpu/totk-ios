@@ -70,7 +70,10 @@ class InputFileStart(unittest.TestCase):
             bad = subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread', str(dup), str(obj),
                                   '-I', str(RUNTIME), '-o', str(out/'bad')], capture_output=True, text=True)
             self.assertNotEqual(bad.returncode, 0)
-            self.assertIn('multiple definition', bad.stderr)
+            # GNU ld says "multiple definition"; Apple ld says "duplicate symbol".
+            link_error = bad.stderr + bad.stdout
+            self.assertIn('input_file_ensure_started', link_error)
+            self.assertTrue('multiple definition' in link_error or 'duplicate symbol' in link_error, link_error)
 
 
 if __name__ == '__main__':

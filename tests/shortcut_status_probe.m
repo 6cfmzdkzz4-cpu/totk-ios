@@ -12,6 +12,12 @@ void mfxup_output_set(int on);
 void shortcut_test_output_init(void);
 void shortcut_test_output_size(unsigned w, unsigned h);
 
+/* The command reader takes runtime_fail's address at startup. dyld resolves that pointer
+   before main, so this probe must define it. A real failure aborts; the test does not open a command file. */
+_Noreturn void runtime_fail(const char *message) {
+    fprintf(stderr, "shortcut probe runtime_fail: %s\n", message ? message : "");
+    abort();
+}
 void dm_gfx_set_flag(const char *name, int value) {
     if (!strcmp(name, "mfx_interp")) mfx_set(value);
     else if (!strcmp(name, "mfx_output")) mfxup_output_set(value);
