@@ -17,6 +17,7 @@
 #include <objc/runtime.h>
 #include <fcntl.h>
 #include "nvn_mtl.h"
+#include "mask_skip.h"
 #include "nvn_obj.h"
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
@@ -2285,8 +2286,26 @@ static void driver_cache_set(int v);
 static void driver_cache_check_set(int v);
 // One shader class can be hidden for geometry fault isolation without restarting.
 // Diagnostic only: measurements with this enabled are never valid performance results.
-static _Atomic uint64_t g_diag_skip_fs;
 static _Atomic uint64_t g_diag_texpng_fs, g_diag_geometry_fs;
+static mask_skip_set g_skip;
+static pthread_mutex_t g_skip_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_skip_active;
+static _Atomic int g_mask_io_left;
+static void skip_publish(void) { atomic_store(&g_skip_active, g_skip.nkey || g_skip.npre || g_skip.mode); }
+static int diag_fs_skipped(const char *key) {
+    if (!key || !atomic_load(&g_skip_active)) return 0;
+    mask_skip_set snap;
+    pthread_mutex_lock(&g_skip_mu);
+    snap = g_skip;
+    pthread_mutex_unlock(&g_skip_mu);
+    return mask_skip_match(&snap, key);
+}
+static void mask_io_note(const char *kind, const char *key, unsigned dw, unsigned dh, unsigned fmt, unsigned sw, unsigned sh) {
+    if (!mask_io_interesting(dw, dh)) return;
+    if (atomic_load(&g_mask_io_left) <= 0) return;
+    if (atomic_fetch_sub(&g_mask_io_left, 1) <= 0) { atomic_store(&g_mask_io_left, 0); return; }
+    MLOG("[mask-io] %s key=%.16s dst=%ux%u fmt=%#x src=%ux%u", kind, key && key[0] ? key : "-", dw, dh, fmt, sw, sh);
+}
 static int diag_shader_prefix_matches(const char *key, uint64_t value) {
     char prefix[17]; snprintf(prefix, sizeof prefix, "%016llx", (unsigned long long)value);
     return key && !strncmp(key, prefix, 16);
@@ -2338,11 +2357,48 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "shadow_index_check")) { atomic_store(&g_shadow_index_check, v != 0); MLOG("[flag] shadow_index_check = %d", v != 0); return; }
     if (!strcmp(name, "pkg_final_cache")) { atomic_store(&g_pkg_final_cache, v != 0); MLOG("[flag] pkg_final_cache = %d", v != 0); return; }
     if (!strcmp(name, "pend_arena_pin")) { atomic_store(&g_pend_arena_pin, v != 0); MLOG("[flag] pend_arena_pin = %d", v != 0); return; }
+    if (!strcmp(name, "skipfs_clear")) {
+        pthread_mutex_lock(&g_skip_mu);
+        g_skip.nkey = g_skip.npre = g_skip.nkeep = g_skip.mode = 0;
+        skip_publish();
+        pthread_mutex_unlock(&g_skip_mu);
+        MLOG("[flag] skipfs_clear (census kept; picture follows the game again)"); return;
+    }
     if (!strncmp(name, "skipfs_", 7)) {
-        const char *p = name + 7;
-        if (strlen(p) != 16 || strspn(p, "0123456789abcdefABCDEF") != 16) { MLOG("[flag] skipfs needs exactly 16 hex digits"); return; }
-        atomic_store(&g_diag_skip_fs, v ? strtoull(p, NULL, 16) : 0);
-        MLOG("[flag] diagnostic skipfs %.16s = %d (incomplete geometry; invalid FPS)", p, v != 0); return;
+        const char *p = name + 7; int n = (int)strlen(p);
+        if (!mask_skip_hex(p, n) || n != 16) { MLOG("[flag] skipfs needs exactly 16 hex digits"); return; }
+        pthread_mutex_lock(&g_skip_mu);
+        int ok = v ? mask_skip_add(g_skip.key, &g_skip.nkey, MASK_SKIP_KEYS, p, n) : (mask_skip_del(g_skip.key, &g_skip.nkey, p, n), 1);
+        skip_publish();
+        int count = g_skip.nkey;
+        pthread_mutex_unlock(&g_skip_mu);
+        MLOG("[flag] skipfs %.16s %s (%d keys; also during deferred replay; incomplete picture)", p, !v ? "off" : ok ? "on" : "not added, list full", count); return;
+    }
+    if (!strncmp(name, "skippre_", 8)) {
+        const char *p = name + 8; int n = (int)strlen(p);
+        if (!mask_skip_hex(p, n)) { MLOG("[flag] skippre needs 1..16 hex digits"); return; }
+        pthread_mutex_lock(&g_skip_mu);
+        int ok = v ? mask_skip_add(g_skip.pre, &g_skip.npre, MASK_SKIP_PRE, p, n) : (mask_skip_del(g_skip.pre, &g_skip.npre, p, n), 1);
+        skip_publish();
+        pthread_mutex_unlock(&g_skip_mu);
+        MLOG("[flag] skippre %s %s", p, !v ? "off" : ok ? "on" : "not added, list full"); return;
+    }
+    if (!strcmp(name, "skipseen") || !strcmp(name, "skiphalf")) {
+        pthread_mutex_lock(&g_skip_mu);
+        if (!strcmp(name, "skipseen")) g_skip.mode = v ? 1 : 0;
+        else g_skip.mode = v < 0 ? 0 : v ? 3 : 2;
+        int seen = g_skip.nseen, mode = g_skip.mode;
+        skip_publish();
+        pthread_mutex_unlock(&g_skip_mu);
+        MLOG("[flag] %s mode=%d census=%d (0 off, 1 all, 2 first half, 3 second half; keep a key with skipkeep_<16 hex>)", name, mode, seen); return;
+    }
+    if (!strncmp(name, "skipkeep_", 9)) {
+        const char *p = name + 9; int n = (int)strlen(p);
+        if (!mask_skip_hex(p, n) || n != 16) { MLOG("[flag] skipkeep needs exactly 16 hex digits"); return; }
+        pthread_mutex_lock(&g_skip_mu);
+        int ok = v ? mask_skip_add(g_skip.keep, &g_skip.nkeep, MASK_SKIP_KEEP, p, n) : (mask_skip_del(g_skip.keep, &g_skip.nkeep, p, n), 1);
+        pthread_mutex_unlock(&g_skip_mu);
+        MLOG("[flag] skipkeep %.16s %s", p, !v ? "off" : ok ? "on" : "not added, list full"); return;
     }
     if (!strncmp(name, "texpngfs_", 9) || !strncmp(name, "geodumpfs_", 10)) {
         int geometry = !strncmp(name, "geodumpfs_", 10);
@@ -2357,7 +2413,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
-    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); MLOG("[flag] mask_draw = %d (one scene frame; 48 detail lines, then every fragment key on that target; sampling unchanged. Hide one key with flag skipfs_<16 hex> 1 and clear it with 0)", v != 0); return; }
+    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); atomic_store(&g_mask_io_left, v ? 48 : 0); MLOG("[flag] mask_draw = %d (one scene frame; 48 detail lines, then every fragment key; up to 48 compute/copy writes of 1920x1440, 320x180, or 120x67. Sampling unchanged)", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -9478,6 +9534,10 @@ static void mask_keys_flush(uint64_t fr) {
     if (!g_mask_draws) return;
     MLOG("[mask-draw] keys F%llu draws=%u unique=%d omitted=%d", (unsigned long long)fr, g_mask_draws, g_mask_nkeys, g_mask_extra);
     for (int i = 0; i < g_mask_nkeys; i++) MLOG("[mask-draw] key %.16s x%u", g_mask_keys[i].key, g_mask_keys[i].n);
+    pthread_mutex_lock(&g_skip_mu);
+    g_skip.nseen = g_mask_nkeys;
+    for (int i = 0; i < g_mask_nkeys; i++) memcpy(g_skip.seen[i], g_mask_keys[i].key, 17);
+    pthread_mutex_unlock(&g_skip_mu);
     g_mask_nkeys = 0; g_mask_extra = 0; g_mask_draws = 0;
 }
 static void mask_key_add(const char *key) {
@@ -9553,6 +9613,10 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (zskip_can_draw(pr)) {   // 零源跳过：输出恒为 0、写 0 盖 0，这次绘制不改变任何结果（见 zskip_can_draw） | Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("零源跳过：首例 通道 %llu", g_stat_pass + 1); }
         PD("N %llu 零源跳过", g_stat_pass + 1); g_draw_skip[1]++; return; }
+    if (pr && pr->sh[1] && diag_fs_skipped(pr->sh[1]->key)) {
+        static uint64_t n; if (++n <= 8 || n % 1000 == 0) MLOG("[skipfs] dropped %.16s replay=%d (%llu)", pr->sh[1]->key, g_defer_replaying, (unsigned long long)n);
+        return;
+    }
     if (!g_defer_replaying) {
         if (g_defer.active && g_defer.in_p && !g_defer.at_q) { if (defer_take(dw, di)) { g_draw_skip[2]++; return; } }
     }
@@ -9593,10 +9657,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     // Draws that cannot draw anything (both faces culled, empty scissor) return before the render pass is opened: otherwise the render pass is already open and on TBDR the whole attachment is loaded and stored for nothing
     // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
     // Diagnostic switch for measuring an upper bound DM_NVN_SKIP_FS=<fragment key>[,<fragment key>...] (none by default): drops all draws of these fragment shaders (the picture will be wrong; only used in real-device ABA to measure "how much GPU time this class of draws is worth in total")
-    { uint64_t skip = atomic_load(&g_diag_skip_fs);
-      if (skip && pr->sh[1] && !g_defer_replaying) { char prefix[17]; snprintf(prefix, sizeof prefix, "%016llx", (unsigned long long)skip);
-          if (!strncmp(pr->sh[1]->key, prefix, 16)) return; }
-      static char sk[16][20]; static int nsk = -1;
+    { static char sk[16][20]; static int nsk = -1;
       if (nsk < 0) { nsk = 0; for (const char *q = getenv("DM_NVN_SKIP_FS"); q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
                      if (nsk) MLOG("DM_NVN_SKIP_FS：丢弃 %d 个片元着色器的绘制（诊断，画面不对）", nsk); }
       if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // 同进程交替测量：本相丢这一类 | In-process alternating measurement: this phase drops this class
@@ -10044,6 +10105,17 @@ static void dispatch(const p_dispatch *dp) {
     if (cpr->missing) { static uint64_t n; if (!n++) MLOG("[shader-miss] 计算着色器还没翻译：跳过这个派发（以后同类不再提示）"); return; }
     NvShader *cs = cpr->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
+    if (atomic_load(&g_mask_io_left) > 0) {
+        registry_lock();
+        for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == NVN_RB_IMG && cs->rf.b[i].reg < 32) {
+            int tid = (int)(S.img[5][cs->rf.b[i].reg] & 0xfffff);
+            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
+                const tex_t *t = &g_treg[tid].t;
+                mask_io_note("dispatch", cs->key, t->d.width, t->d.height, t->d.format, (unsigned)dp->x, (unsigned)dp->y);
+            }
+        }
+        registry_unlock();
+    }
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
@@ -10222,7 +10294,7 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     if (!nogpu() && cb.status != MTLCommandBufferStatusCompleted) die("WriteTexels: GPU upload failed");
 }
 static void copy_b2t(const p_copy_b2t *c) {
-    if (c->tex) zskip_del(c->tex->serial);
+    if (c->tex) { mask_io_note("copy-b2t", NULL, c->tex->d.width, c->tex->d.height, c->tex->d.format, (unsigned)c->r.width, (unsigned)c->r.height); zskip_del(c->tex->serial); }
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
     if (!t) return;
@@ -10302,6 +10374,7 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // GPU：贴图 → 贴图（原先误列为空操作，选角页每帧 3 次）。等尺寸、不镜像、同格式 → 逐层 blit；其余语义（缩放带过滤、镜像、换格式）blit 表达不了，报红待实现
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
+    if (c->dst) mask_io_note("copy-t2t", NULL, c->dst->d.width, c->dst->d.height, c->dst->d.format, c->src ? c->src->d.width : 0, c->src ? c->src->d.height : 0);
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
     rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);
@@ -10346,7 +10419,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 // Whole level and whole face, all four channels written -> open one clear-only render pass per layer / depth slice (the hardware converts the clear value by the texture format, including integer and depth);
 // view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
 static void clear_tex(const p_clear_tex *c) {
-    if (c->tex) zskip_del(c->tex->serial);
+    if (c->tex) { mask_io_note("clear", NULL, c->tex->d.width, c->tex->d.height, c->tex->d.format, (unsigned)c->r.width, (unsigned)c->r.height); zskip_del(c->tex->serial); }
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("X ser=%llu 视图格式 %#x 区域 %d,%d,%d %dx%dx%d 掩码 %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);

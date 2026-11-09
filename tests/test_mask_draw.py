@@ -1,5 +1,6 @@
 """World-space gloom coverage is not a reason to retarget NVN clamp modes."""
 from pathlib import Path
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,14 +29,33 @@ class MaskDraw(unittest.TestCase):
         self.assertIn('blend=%#x', MTL)
         self.assertIn('mask_draw_note(pr)', MTL)
         self.assertIn('samp=repeat', MTL)
-        self.assertIn('skipfs_', MTL)
-        skip = MTL.index('uint64_t skip = atomic_load(&g_diag_skip_fs);')
-        self.assertIn('if (skip && pr->sh[1]', MTL[skip:skip + 400])
+        self.assertIn('[mask-io] %s key=%.16s dst=%ux%u fmt=%#x src=%ux%u', MTL)
+        self.assertIn('mask_io_note("dispatch"', MTL)
+        self.assertIn('mask_io_note("copy-t2t"', MTL)
+        self.assertIn('mask_io_note("copy-b2t"', MTL)
+        self.assertIn('mask_io_note("clear"', MTL)
+        for name in ('skipfs_clear', 'skippre_', 'skipseen', 'skiphalf', 'skipkeep_'):
+            self.assertIn(name, MTL)
+        drop = MTL.index('diag_fs_skipped(pr->sh[1]->key)')
+        condition = MTL[MTL.rfind('\n', 0, drop):MTL.find('\n', drop)]
+        self.assertNotIn('g_defer_replaying', condition)
+        self.assertIn('replay=%d', MTL[drop:drop + 280])
+        self.assertLess(drop, MTL.index('defer_take(dw, di)', drop))
         self.assertIn('setenv("TOTK_INPUT_FILE", commands.fileSystemRepresentation, 0);', MAIN)
-        # The note runs only after a draw has already survived the missing-shader skip.
         miss = MTL.index('shader_miss_note(pr); g_draw_skip[15]++; return;')
         note = MTL.index('mask_draw_note(pr);')
         self.assertLess(miss, note)
+
+    def test_skip_rules_match_several_keys_prefixes_and_halves(self):
+        source = ROOT/'tests/test_mask_skip.c'
+        binary = Path('/tmp/totk-mask-skip')
+        build = subprocess.run(
+            ['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)],
+            capture_output=True, text=True)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        run = subprocess.run([str(binary)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('mask skip checks passed', run.stdout)
 
 
 if __name__ == '__main__':
