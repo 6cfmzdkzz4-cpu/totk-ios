@@ -138,12 +138,14 @@ __attribute__((constructor)) static void input_script_start(void) {
    kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
 extern void runtime_front_request_close(void);
-static void *input_file(void *arg) {
-    FILE *f = fopen((const char *)arg, "r"); if (!f) runtime_fail("cannot open TOTK_INPUT_FILE");
+static int input_file_stop;
+static void input_file_on_line(const char *text, void *ctx) {
+    (void)ctx;
     char line[1200];
-    for (;;) {
-        if (!fgets(line, sizeof line, f)) { if (ferror(f)) runtime_fail("diagnostic input read"); clearerr(f); usleep(100000); continue; }
-        if (runtime_survey_command(line)) continue;
+    size_t n = strlen(text);
+    if (n >= sizeof line) runtime_fail("diagnostic input line too long");
+    memcpy(line, text, n + 1);
+    if (runtime_survey_command(line)) return;
         unsigned code, ms; int used = 0;
         if (sscanf(line, "down %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
             fprintf(stderr,"[totk-input] file: key %u down\n",code);runtime_input_key_synthetic(code,1);
@@ -192,10 +194,21 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
-        } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
+        }         else if (!strcmp(line, "close\n")) { runtime_front_request_close(); input_file_stop = 1; }
         else runtime_fail("invalid diagnostic input command");
+}
+static void *input_file(void *arg) {
+    input_file_reader reader;
+    input_file_reader_init(&reader, arg);
+    free(arg);
+    if (!reader.path) runtime_fail("diagnostic input path");
+    for (;;) {
+        input_file_reader_poll(&reader, input_file_on_line, NULL, runtime_fail);
+        if (input_file_stop) break;
+        usleep(100000);
     }
-    fclose(f); return NULL;
+    input_file_reader_close(&reader);
+    return NULL;
 }
 void runtime_input_file_start(void) {
     input_file_ensure_started(getenv("TOTK_INPUT_FILE"), input_file, runtime_fail);
