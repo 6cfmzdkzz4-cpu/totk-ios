@@ -24,6 +24,11 @@ EXPERIMENTAL_APP_FILENAME = "TOTK-FreeAutobuild.app"
 # carries no valid Nintendo ACID signature. All executable and RomFS gates stay
 # unchanged, and the metadata is never embedded in the personal app.
 KNOWN_UNUSED_NPDM = "e78c40978c23b42866973e6fe506c2ad7716ec51c651f35bfeada3415bb3b634"
+# A cached incremental build measured about 0.4 GiB net. 12 GiB stays above the packaging floor.
+CACHED_MIN_FREE_GIB = 12
+UNCACHED_APP_MIN_FREE_GIB = 45
+UNCACHED_IPA_MIN_FREE_GIB = 65
+PACK_MIN_FREE_GIB = 8
 
 
 def accept_known_unused_metadata(tree: Path, game: Path) -> bool:
@@ -74,7 +79,42 @@ def parse_args(argv=None):
                         help="build the separate Free Autobuild trial; refuses com.willspain.totk")
     parser.add_argument("--build-number", type=int, default=27)
     parser.add_argument("--dotnet", default="dotnet", help=".NET 10 SDK executable used to build the source-only shader translator")
+    parser.add_argument("--min-free-gib", type=float, default=None,
+                        help="override the preflight free-space requirement; cached RomFS otherwise requires 12 GiB, an uncached .app 45, and an uncached .ipa 65. TOTK_MIN_FREE_GIB is the same override")
     return parser.parse_args(argv)
+
+
+def free_requirement_gib(cached: bool, ipa: bool, override: float | None) -> float:
+    """GiB that must be free before starting. Uncached defaults stay at the full-extract requirement."""
+    if override is not None:
+        return override
+    if cached:
+        return CACHED_MIN_FREE_GIB
+    return UNCACHED_IPA_MIN_FREE_GIB if ipa else UNCACHED_APP_MIN_FREE_GIB
+
+
+def resolve_min_free(args) -> float | None:
+    """CLI wins over TOTK_MIN_FREE_GIB. Either value must stay at or above the packaging floor."""
+    raw = args.min_free_gib
+    if raw is None:
+        env = os.environ.get("TOTK_MIN_FREE_GIB", "").strip()
+        if not env:
+            return None
+        try:
+            raw = float(env)
+        except ValueError:
+            raise upstream.BuildError("TOTK_MIN_FREE_GIB must be a number of GiB") from None
+    if raw < PACK_MIN_FREE_GIB:
+        raise upstream.BuildError(f"--min-free-gib and TOTK_MIN_FREE_GIB must be at least {PACK_MIN_FREE_GIB:g} GiB")
+    return raw
+
+
+def assert_free_space(path: Path, gib: float, when: str) -> None:
+    """Stop before using a volume that is already below the stated floor."""
+    target = path if path.exists() else path.parent
+    free = shutil.disk_usage(target).free
+    if free < gib * 2**30:
+        raise upstream.BuildError(f"{when}: {free / 2**30:.1f} GiB free at {target}, need at least {gib:g} GiB")
 
 
 def experimental_personal_app(work: Path, out: Path, experimental: bool) -> Path:
@@ -188,9 +228,10 @@ def main(argv=None):
     args.work.mkdir(parents=True, exist_ok=True)
     logs = args.work / "logs"
     cached = (args.work / "totk/extracted/v0/romfs/romfs.bin").is_file()
-    required = 25 if cached else (65 if args.out.suffix.lower() == ".ipa" else 45)
-    if shutil.disk_usage(args.work).free < required * 2**30:
-        raise upstream.BuildError(f"allow at least {required} GiB free on the work volume")
+    ipa = args.out.suffix.lower() == ".ipa"
+    required = free_requirement_gib(cached, ipa, resolve_min_free(args))
+    kind = "cached RomFS" if cached else "uncached"
+    assert_free_space(args.work, required, f"allow at least {required:g} GiB free on the work volume for a {kind} build")
     env = dict(os.environ, PATH=os.pathsep.join(upstream.TOOL_PATHS + [os.environ.get("PATH", "")]))
     tree = upstream.prepare_work(args.work, py, logs)
     try:
@@ -241,17 +282,23 @@ def main(argv=None):
     upstream.step_shaders(tree, logs, version="v0")
     upstream.step_binary(tree, args.game, args.keys, env, logs, version="v0")
     personal_app = experimental_personal_app(args.work, args.out, args.experimental_free_autobuild)
+    assert_free_space(args.work, PACK_MIN_FREE_GIB, "packaging stopped")
+    assert_free_space(args.out.parent, PACK_MIN_FREE_GIB, "packaging stopped")
     ios_cmd = [str(tree / ".venv/bin/python"), "ios/tools/build_ipa.py",
                *ios_package_arguments(tree, personal_app, logs, args.bundle_id, args.display, args.build_number,
                                       args.cloud_container, args.experimental_free_autobuild, args.app_icon)]
     run(ios_cmd, "build-ios.log")
     receipt["compiled"] = True
     receipt["ios_dependencies"] = json.loads((tree / "build/ios-deps/manifest.json").read_text())
+    assert_free_space(args.work, PACK_MIN_FREE_GIB, "packaging stopped")
+    assert_free_space(args.out.parent, PACK_MIN_FREE_GIB, "packaging stopped")
     if args.team:
         from ios_sign import sign_app
         sign_app(personal_app, args.team, args.device, args.cloud_container, args.work / "signing")
         receipt["signed"] = True
     if args.out.suffix.lower() == ".ipa":
+        assert_free_space(args.work, PACK_MIN_FREE_GIB, "packaging stopped")
+        assert_free_space(args.out.parent, PACK_MIN_FREE_GIB, "packaging stopped")
         payload = args.work / "ipa/Payload"
         upstream.say("Packing the personal IPA; this contains your game and must stay private")
         if payload.parent.exists():

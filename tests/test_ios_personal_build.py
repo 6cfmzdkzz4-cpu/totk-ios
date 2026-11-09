@@ -1,6 +1,7 @@
 """Regression checks for the personal build's identity and exact metadata boundary."""
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -54,6 +55,41 @@ class PersonalBuildTests(unittest.TestCase):
                 (folder / "main").write_bytes(b"unexpected executable")
                 with self.assertRaises(builder.upstream.BuildError):
                     builder.accept_known_unused_metadata(root, Path("synthetic.nsp"))
+
+    def test_cached_romfs_requires_12_gib_and_uncached_stays_at_the_full_extract(self):
+        self.assertEqual(builder.free_requirement_gib(True, True, None), 12)
+        self.assertEqual(builder.free_requirement_gib(True, False, None), 12)
+        self.assertEqual(builder.free_requirement_gib(False, False, None), 45)
+        self.assertEqual(builder.free_requirement_gib(False, True, None), 65)
+        self.assertEqual(builder.free_requirement_gib(False, True, 12), 12)
+
+    def test_preflight_names_the_shortfall(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            low = type("Usage", (), {"free": 11 * 2**30})()
+            with patch.object(builder.shutil, "disk_usage", return_value=low):
+                with self.assertRaisesRegex(builder.upstream.BuildError, r"cached RomFS build: 11\.0 GiB free"):
+                    builder.assert_free_space(work, builder.free_requirement_gib(True, False, None),
+                                              "allow at least 12 GiB free on the work volume for a cached RomFS build")
+
+    def test_min_free_override_uses_the_flag_before_the_environment(self):
+        base = ["game.nsp", "--keys", "prod.keys", "--bundle-id", "com.example.totk"]
+        with patch.dict(os.environ, {"TOTK_MIN_FREE_GIB": "30"}):
+            self.assertEqual(builder.resolve_min_free(builder.parse_args(base + ["--min-free-gib", "14"])), 14)
+        with patch.dict(os.environ, {"TOTK_MIN_FREE_GIB": "16"}):
+            self.assertEqual(builder.resolve_min_free(builder.parse_args(base)), 16)
+        with patch.dict(os.environ, {"TOTK_MIN_FREE_GIB": "lots"}):
+            with self.assertRaisesRegex(builder.upstream.BuildError, "TOTK_MIN_FREE_GIB must be a number"):
+                builder.resolve_min_free(builder.parse_args(base))
+        with patch.dict(os.environ, {"TOTK_MIN_FREE_GIB": "7"}):
+            with self.assertRaisesRegex(builder.upstream.BuildError, "at least 8 GiB"):
+                builder.resolve_min_free(builder.parse_args(base))
+
+    def test_packaging_aborts_under_8_gib(self):
+        low = type("Usage", (), {"free": 7 * 2**30})()
+        with tempfile.TemporaryDirectory() as temp, patch.object(builder.shutil, "disk_usage", return_value=low):
+            with self.assertRaisesRegex(builder.upstream.BuildError, r"packaging stopped: 7\.0 GiB free"):
+                builder.assert_free_space(Path(temp), builder.PACK_MIN_FREE_GIB, "packaging stopped")
 
     def test_metadata_exception_rejects_unbound_source_or_title(self):
         with tempfile.TemporaryDirectory() as temp:
