@@ -2291,9 +2291,12 @@ static mask_skip_set g_skip;
 static pthread_mutex_t g_skip_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_skip_active;
 static _Atomic int g_mask_io_left;
+static int g_mask_io_notes;
 static void skip_publish(void) { atomic_store(&g_skip_active, g_skip.nkey || g_skip.npre || g_skip.mode); }
-static int diag_fs_skipped(const char *key) {
-    if (!key || !atomic_load(&g_skip_active)) return 0;
+/* Census skips (skipseen, skiphalf, skipn) apply only to the 1920x1440 scene color target.
+   Explicit skipfs and skippre keys do too: dropping the same shader on a depth or shadow target is what froze the frame. */
+static int diag_fs_skipped(const char *key, int scene) {
+    if (!scene || !key || !atomic_load(&g_skip_active)) return 0;
     mask_skip_set snap;
     pthread_mutex_lock(&g_skip_mu);
     snap = g_skip;
@@ -2301,9 +2304,10 @@ static int diag_fs_skipped(const char *key) {
     return mask_skip_match(&snap, key);
 }
 static void mask_io_note(const char *kind, const char *key, unsigned dw, unsigned dh, unsigned fmt, unsigned sw, unsigned sh) {
-    if (!mask_io_interesting(dw, dh)) return;
+    if (!mask_io_interesting(dw, dh) && !mask_io_interesting(sw, sh)) return;
     if (atomic_load(&g_mask_io_left) <= 0) return;
     if (atomic_fetch_sub(&g_mask_io_left, 1) <= 0) { atomic_store(&g_mask_io_left, 0); return; }
+    g_mask_io_notes++;
     MLOG("[mask-io] %s key=%.16s dst=%ux%u fmt=%#x src=%ux%u", kind, key && key[0] ? key : "-", dw, dh, fmt, sw, sh);
 }
 static int diag_shader_prefix_matches(const char *key, uint64_t value) {
@@ -2359,7 +2363,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "pend_arena_pin")) { atomic_store(&g_pend_arena_pin, v != 0); MLOG("[flag] pend_arena_pin = %d", v != 0); return; }
     if (!strcmp(name, "skipfs_clear")) {
         pthread_mutex_lock(&g_skip_mu);
-        g_skip.nkey = g_skip.npre = g_skip.nkeep = g_skip.mode = 0;
+        g_skip.nkey = g_skip.npre = g_skip.nkeep = g_skip.mode = g_skip.limit = 0;
         skip_publish();
         pthread_mutex_unlock(&g_skip_mu);
         MLOG("[flag] skipfs_clear (census kept; picture follows the game again)"); return;
@@ -2372,7 +2376,7 @@ void dm_gfx_set_flag(const char *name, int v) {
         skip_publish();
         int count = g_skip.nkey;
         pthread_mutex_unlock(&g_skip_mu);
-        MLOG("[flag] skipfs %.16s %s (%d keys; also during deferred replay; incomplete picture)", p, !v ? "off" : ok ? "on" : "not added, list full", count); return;
+        MLOG("[flag] skipfs %.16s %s (%d keys; 1920x1440 color target only)", p, !v ? "off" : ok ? "on" : "not added, list full", count); return;
     }
     if (!strncmp(name, "skippre_", 8)) {
         const char *p = name + 8; int n = (int)strlen(p);
@@ -2390,7 +2394,17 @@ void dm_gfx_set_flag(const char *name, int v) {
         int seen = g_skip.nseen, mode = g_skip.mode;
         skip_publish();
         pthread_mutex_unlock(&g_skip_mu);
-        MLOG("[flag] %s mode=%d census=%d (0 off, 1 all, 2 first half, 3 second half; keep a key with skipkeep_<16 hex>)", name, mode, seen); return;
+        MLOG("[flag] %s mode=%d census=%d scene=1920x1440 only (0 off, 1 all, 2 first half, 3 second half). skipn N skips the N heaviest keys", name, mode, seen); return;
+    }
+    if (!strcmp(name, "skipn")) {
+        if (v < 0 || v > 8) { MLOG("[flag] skipn requires 0..8"); return; }
+        pthread_mutex_lock(&g_skip_mu);
+        g_skip.mode = v ? 4 : 0;
+        g_skip.limit = v;
+        int seen = g_skip.nseen;
+        skip_publish();
+        pthread_mutex_unlock(&g_skip_mu);
+        MLOG("[flag] skipn %d census=%d scene=1920x1440 only (heaviest keys first; 0 off)", v, seen); return;
     }
     if (!strncmp(name, "skipkeep_", 9)) {
         const char *p = name + 9; int n = (int)strlen(p);
@@ -2413,7 +2427,11 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
-    if (!strcmp(name, "mask_draw")) { atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0); atomic_store(&g_mask_io_left, v ? 48 : 0); MLOG("[flag] mask_draw = %d (one scene frame; 48 detail lines, then every fragment key; up to 48 compute/copy writes of 1920x1440, 320x180, or 120x67. Sampling unchanged)", v != 0); return; }
+    if (!strcmp(name, "mask_draw")) {
+        atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0);
+        atomic_store(&g_mask_io_left, v ? 48 : 0); g_mask_io_notes = 0;
+        MLOG("[flag] mask_draw = %d (one scene frame; key list is heaviest first. [mask-io] frame writes=N follows it, including 0. Sampling unchanged)", v != 0); return;
+    }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -8825,6 +8843,7 @@ static void clear_quad_core(id<MTL4RenderCommandEncoder> en, const uint32_t cfmt
 static void clear_quad(const p_clear_color *c) {
     gpu_path_on("TOTK_GPU_MIDCLEAR", "mid-pass / partial-mask / scissored color clear");
     const tex_t *t = R.rt.color[c->index];
+    if (t) mask_io_note("clear-rt", NULL, t->d.width, t->d.height, t->d.format, 0, 0);
     int f = R.rt.has_cview[c->index] && R.rt.cview[c->index].set_format ? R.rt.cview[c->index].format : t->d.format;
     if (cls_of(f)) MDIE("partial color clear of integer render target format %#x not implemented", f);
     id<MTL4RenderCommandEncoder> en = rp_begin(); if (!en) return;
@@ -9532,8 +9551,15 @@ static int g_mask_nkeys, g_mask_extra;
 static unsigned g_mask_draws;
 static void mask_keys_flush(uint64_t fr) {
     if (!g_mask_draws) return;
+    for (int i = 1; i < g_mask_nkeys; i++) for (int j = i; j > 0 && g_mask_keys[j].n > g_mask_keys[j - 1].n; j--) {
+        char key[17]; unsigned n = g_mask_keys[j].n; memcpy(key, g_mask_keys[j].key, 17);
+        memcpy(g_mask_keys[j].key, g_mask_keys[j - 1].key, 17); g_mask_keys[j].n = g_mask_keys[j - 1].n;
+        memcpy(g_mask_keys[j - 1].key, key, 17); g_mask_keys[j - 1].n = n;
+    }
     MLOG("[mask-draw] keys F%llu draws=%u unique=%d omitted=%d", (unsigned long long)fr, g_mask_draws, g_mask_nkeys, g_mask_extra);
     for (int i = 0; i < g_mask_nkeys; i++) MLOG("[mask-draw] key %.16s x%u", g_mask_keys[i].key, g_mask_keys[i].n);
+    MLOG("[mask-io] frame %llu writes=%d", (unsigned long long)fr, g_mask_io_notes);
+    g_mask_io_notes = 0;
     pthread_mutex_lock(&g_skip_mu);
     g_skip.nseen = g_mask_nkeys;
     for (int i = 0; i < g_mask_nkeys; i++) memcpy(g_skip.seen[i], g_mask_keys[i].key, 17);
@@ -9613,8 +9639,15 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (zskip_can_draw(pr)) {   // 零源跳过：输出恒为 0、写 0 盖 0，这次绘制不改变任何结果（见 zskip_can_draw） | Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("零源跳过：首例 通道 %llu", g_stat_pass + 1); }
         PD("N %llu 零源跳过", g_stat_pass + 1); g_draw_skip[1]++; return; }
-    if (pr && pr->sh[1] && diag_fs_skipped(pr->sh[1]->key)) {
-        static uint64_t n; if (++n <= 8 || n % 1000 == 0) MLOG("[skipfs] dropped %.16s replay=%d (%llu)", pr->sh[1]->key, g_defer_replaying, (unsigned long long)n);
+    int scene_target = R.has_rt && R.rt.n && R.rt.color[0] && R.rt.color[0]->d.width == 1920 && R.rt.color[0]->d.height == 1440;
+    if (pr && pr->sh[1] && diag_fs_skipped(pr->sh[1]->key, scene_target)) {
+        static uint64_t logged_frame, drops;
+        uint64_t fr = atomic_load(&g_cur_frame);
+        if (fr != logged_frame) {
+            if (logged_frame && drops) MLOG("[skipfs] frame %llu dropped %llu draws on 1920x1440", (unsigned long long)logged_frame, (unsigned long long)drops);
+            logged_frame = fr; drops = 0;
+        }
+        drops++;
         return;
     }
     if (!g_defer_replaying) {

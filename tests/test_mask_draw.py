@@ -34,12 +34,14 @@ class MaskDraw(unittest.TestCase):
         self.assertIn('mask_io_note("copy-t2t"', MTL)
         self.assertIn('mask_io_note("copy-b2t"', MTL)
         self.assertIn('mask_io_note("clear"', MTL)
-        for name in ('skipfs_clear', 'skippre_', 'skipseen', 'skiphalf', 'skipkeep_'):
+        for name in ('skipfs_clear', 'skippre_', 'skipseen', 'skiphalf', 'skipkeep_', 'skipn'):
             self.assertIn(name, MTL)
-        drop = MTL.index('diag_fs_skipped(pr->sh[1]->key)')
-        condition = MTL[MTL.rfind('\n', 0, drop):MTL.find('\n', drop)]
-        self.assertNotIn('g_defer_replaying', condition)
-        self.assertIn('replay=%d', MTL[drop:drop + 280])
+        self.assertIn('[mask-io] frame %llu writes=%d', MTL)
+        self.assertIn('mask_io_note("clear-rt"', MTL)
+        drop = MTL.index('diag_fs_skipped(pr->sh[1]->key, scene_target)')
+        gate = MTL[drop - 400:drop]
+        self.assertIn('d.width == 1920', gate)
+        self.assertIn('d.height == 1440', gate)
         self.assertLess(drop, MTL.index('defer_take(dw, di)', drop))
         self.assertIn('setenv("TOTK_INPUT_FILE", commands.fileSystemRepresentation, 0);', MAIN)
         miss = MTL.index('shader_miss_note(pr); g_draw_skip[15]++; return;')

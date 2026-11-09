@@ -28,6 +28,8 @@ int main(void) {
     s.mode = 3;
     if (mask_skip_match(&s, "aaaaaaaaaaaaaaaa") || mask_skip_match(&s, "cccccccccccccccc")) return 12;
     if (!mask_skip_match(&s, "dddddddddddddddd")) return 13;
+    s.mode = 4; s.limit = 1;
+    if (!mask_skip_match(&s, "aaaaaaaaaaaaaaaa") || mask_skip_match(&s, "bbbbbbbbbbbbbbbb")) return 21;
     if (!add_key(&s, "cccccccccccccccc") || !mask_skip_match(&s, "cccccccccccccccc")) return 14;
     if (!mask_io_interesting(1920, 1440) || !mask_io_interesting(320, 180) || !mask_io_interesting(120, 67)) return 15;
     if (mask_io_interesting(1920, 1080) || mask_io_interesting(512, 512)) return 16;

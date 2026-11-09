@@ -17,7 +17,8 @@ typedef struct {
     int nkeep;
     char seen[MASK_SEEN_MAX][17];
     int nseen;
-    int mode; /* 0 off, 1 every seen key, 2 first half, 3 second half */
+    int mode; /* 0 off, 1 every seen key, 2 first half, 3 second half, 4 first `limit` keys */
+    int limit;
 } mask_skip_set;
 
 static char mask_skip_lower(char c) {
@@ -65,7 +66,7 @@ static int mask_skip_match(const mask_skip_set *s, const char *key) {
     if (!s->mode || s->nseen <= 0) return 0;
     int half = s->nseen / 2;
     int lo = s->mode == 3 ? half : 0;
-    int hi = s->mode == 2 ? half : s->nseen;
+    int hi = s->mode == 2 ? half : s->mode == 4 ? (s->limit < s->nseen ? s->limit : s->nseen) : s->nseen;
     for (int i = lo; i < hi; i++) {
         if (strncmp(key, s->seen[i], 16)) continue;
         for (int k = 0; k < s->nkeep; k++) if (!strncmp(key, s->keep[k], 16)) return 0;
