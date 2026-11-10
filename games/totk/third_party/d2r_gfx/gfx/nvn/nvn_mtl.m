@@ -2317,7 +2317,42 @@ static int diag_shader_prefix_matches(const char *key, uint64_t value) {
 static _Atomic int g_mask_frames;
 static _Atomic uint64_t g_mask_frame;
 static _Atomic unsigned g_skiptgt_w, g_skiptgt_h;
+static _Atomic unsigned g_skipfmt_w, g_skipfmt_h, g_skipfmt;
+static char g_skip960[17];
+static _Atomic int g_skip960_on;
 static _Atomic int g_skippass = -1;
+static pthread_mutex_t g_diag_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_diag_ack[300];
+static void diag_path(char *out, size_t n) {
+    const char *in = getenv("TOTK_INPUT_FILE");
+    const char *slash = in ? strrchr(in, '/') : NULL;
+    if (!slash || (size_t)(slash - in) + 12 >= n) { if (n) out[0] = 0; return; }
+    snprintf(out, n, "%.*s/diag.txt", (int)(slash - in), in);
+}
+static void diag_replace(const char *body) {
+    char path[1024]; diag_path(path, sizeof path); if (!path[0]) return;
+    pthread_mutex_lock(&g_diag_mu);
+    FILE *f = fopen(path, "w");
+    if (f) { fputs(body, f); if (!body[0] || body[strlen(body) - 1] != '\n') fputc('\n', f); fclose(f); }
+    pthread_mutex_unlock(&g_diag_mu);
+}
+static void diag_ack(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt); vsnprintf(g_diag_ack, sizeof g_diag_ack, fmt, ap); va_end(ap);
+    MLOG("%s", g_diag_ack);
+    diag_replace(g_diag_ack);
+}
+static void diag_append(const char *line) {
+    char path[1024]; diag_path(path, sizeof path); if (!path[0]) return;
+    pthread_mutex_lock(&g_diag_mu);
+    FILE *f = fopen(path, "a");
+    if (f) { fputs(line, f); if (!line[0] || line[strlen(line) - 1] != '\n') fputc('\n', f); fclose(f); }
+    pthread_mutex_unlock(&g_diag_mu);
+}
+static void diag_status(const char *line) {
+    static time_t last; time_t now = time(NULL); if (now == last) return; last = now;
+    MLOG("%s", line);
+    char body[700]; snprintf(body, sizeof body, "%s\n%s\n", g_diag_ack, line); diag_replace(body);
+}
 void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "arg_epoch")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_on, v != 0); MLOG("[flag] arg_epoch = %d", v != 0); return; }
     if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
@@ -2409,11 +2444,24 @@ void dm_gfx_set_flag(const char *name, int v) {
         MLOG("[flag] skipn %d census=%d scene=1920x1440 only (heaviest keys first; 0 off)", v, seen); return;
     }
     if (!strncmp(name, "skiptgt_", 8)) {
-        unsigned w = 0, h = 0;
-        if (sscanf(name + 8, "%ux%u", &w, &h) != 2 || !w || !h || w > 8192 || h > 8192) { MLOG("[flag] skiptgt needs WxH, for example skiptgt_960x720"); return; }
-        if (w == 1920 && h == 1440) { MLOG("[flag] skiptgt refuses 1920x1440; that is the scene color target"); return; }
+        unsigned w = 0, h = 0, fmt = 0;
+        if (sscanf(name + 8, "%ux%u_fmt%x", &w, &h, &fmt) == 3 && w && h && w <= 8192 && h <= 8192) {
+            atomic_store(&g_skiptgt_w, 0); atomic_store(&g_skiptgt_h, 0);
+            atomic_store(&g_skipfmt_w, v ? w : 0); atomic_store(&g_skipfmt_h, v ? h : 0); atomic_store(&g_skipfmt, v ? fmt : 0);
+            diag_ack("[flag] skiptgt %ux%u fmt=%#x %s", w, h, fmt, v ? "on" : "off"); return;
+        }
+        if (sscanf(name + 8, "%ux%u", &w, &h) != 2 || !w || !h || w > 8192 || h > 8192) { diag_ack("[flag] skiptgt needs WxH or WxH_fmtHEX"); return; }
+        if (w == 1920 && h == 1440) { diag_ack("[flag] skiptgt refuses 1920x1440; that is the scene color target"); return; }
+        atomic_store(&g_skipfmt_w, 0); atomic_store(&g_skipfmt_h, 0); atomic_store(&g_skipfmt, 0);
         atomic_store(&g_skiptgt_w, v ? w : 0); atomic_store(&g_skiptgt_h, v ? h : 0);
-        MLOG("[flag] skiptgt %ux%u %s (other sizes of the same shader still draw)", w, h, v ? "on" : "off"); return;
+        diag_ack("[flag] skiptgt %ux%u %s (other sizes of the same shader still draw)", w, h, v ? "on" : "off"); return;
+    }
+    if (!strncmp(name, "skip960_", 8)) {
+        const char *p = name + 8; int n = (int)strlen(p);
+        if (!mask_skip_hex(p, n) || n != 16) { diag_ack("[flag] skip960 needs exactly 16 hex digits"); return; }
+        if (v) { for (int i = 0; i < 16; i++) g_skip960[i] = mask_skip_lower(p[i]); g_skip960[16] = 0; }
+        atomic_store(&g_skip960_on, v != 0);
+        diag_ack("[flag] skip960 %.16s %s (960x720 only)", p, v ? "on" : "off"); return;
     }
     if (!strcmp(name, "skippass")) {
         if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
@@ -9560,6 +9608,13 @@ void mtl_shader_miss_window(char *buf, size_t cap) {
 __attribute__((weak)) float dm_bright_k(void);
 /* One scene frame. The first 48 draws keep sampler, swizzle, and blend detail. Every fragment key on that
    target is counted, including draws after those 48 lines. No texels and no shader bytes. Sampling is unchanged. */
+static struct { char key[17]; unsigned fmt, n; } g_half[24];
+static int g_half_n, g_half_over;
+static void half_add(const char *key, unsigned fmt) {
+    for (int i = 0; i < g_half_n; i++) if (!strncmp(g_half[i].key, key, 16) && g_half[i].fmt == fmt) { g_half[i].n++; return; }
+    if (g_half_n >= 24) { g_half_over++; return; }
+    snprintf(g_half[g_half_n].key, 17, "%.16s", key); g_half[g_half_n].fmt = fmt; g_half[g_half_n].n = 1; g_half_n++;
+}
 static struct { char key[17]; unsigned n; } g_mask_keys[64], g_mask_more[16];
 static int g_mask_nkeys, g_mask_more_n, g_mask_extra;
 static unsigned g_mask_draws;
@@ -9592,6 +9647,16 @@ static void mask_keys_flush(uint64_t fr) {
     for (int i = 0; i < g_cs_n; i++) MLOG("[mask-cs] F%llu %ux%u fmt=%#x dispatches=%u", (unsigned long long)fr, g_cs_hist[i].w, g_cs_hist[i].h, g_cs_hist[i].fmt, g_cs_hist[i].n);
     if (g_cs_over) MLOG("[mask-cs] F%llu +%d sizes", (unsigned long long)fr, g_cs_over);
     if (!g_cs_n && !g_cs_over) MLOG("[mask-cs] F%llu dispatches=0", (unsigned long long)fr);
+    for (int i = 1; i < g_half_n; i++) for (int j = i; j > 0 && g_half[j].n > g_half[j - 1].n; j--) {
+        char key[17]; unsigned fmt = g_half[j].fmt, n = g_half[j].n; memcpy(key, g_half[j].key, 17);
+        memcpy(g_half[j].key, g_half[j - 1].key, 17); g_half[j].fmt = g_half[j - 1].fmt; g_half[j].n = g_half[j - 1].n;
+        memcpy(g_half[j - 1].key, key, 17); g_half[j - 1].fmt = fmt; g_half[j - 1].n = n;
+    }
+    for (int i = 0; i < g_half_n; i++) {
+        char line[80]; snprintf(line, sizeof line, "[mask-half] %.16s fmt=%#x x%u", g_half[i].key, g_half[i].fmt, g_half[i].n);
+        MLOG("%s", line); diag_append(line);
+    }
+    if (g_half_over) { char line[64]; snprintf(line, sizeof line, "[mask-half] +%d keys", g_half_over); MLOG("%s", line); diag_append(line); }
     MLOG("[mask-io] frame %llu writes=%d", (unsigned long long)fr, g_mask_io_notes);
     g_mask_io_notes = 0;
     pthread_mutex_lock(&g_skip_mu);
@@ -9599,7 +9664,7 @@ static void mask_keys_flush(uint64_t fr) {
     for (int i = 0; i < g_mask_nkeys; i++) memcpy(g_skip.seen[i], g_mask_keys[i].key, 17);
     pthread_mutex_unlock(&g_skip_mu);
     g_mask_nkeys = g_mask_more_n = g_mask_extra = 0; g_mask_draws = 0;
-    g_rt_n = g_rt_over = g_cs_n = g_cs_over = 0;
+    g_rt_n = g_rt_over = g_cs_n = g_cs_over = g_half_n = g_half_over = 0;
 }
 static void mask_key_add(const char *key) {
     g_mask_draws++;
@@ -9622,12 +9687,13 @@ static void mask_draw_note(NvProg *pr) {
     if (fr != atomic_load(&g_mask_frame)) {
         uint64_t prev = atomic_load(&g_mask_frame);
         if (prev) mask_keys_flush(prev);
-        else { g_mask_nkeys = g_mask_more_n = g_mask_extra = 0; g_mask_draws = 0; g_rt_n = g_rt_over = g_cs_n = g_cs_over = 0; }
+        else { g_mask_nkeys = g_mask_more_n = g_mask_extra = 0; g_mask_draws = 0; g_rt_n = g_rt_over = g_cs_n = g_cs_over = g_half_n = g_half_over = 0; }
         if (prev && atomic_fetch_sub(&g_mask_frames, 1) - 1 <= 0) return;
         atomic_store(&g_mask_frame, fr); lines = 48;
         MLOG("[mask-draw] frame %llu bright=%.3f", (unsigned long long)fr, dm_bright_k());
     }
     hist_add(g_rt_hist, &g_rt_n, 24, &g_rt_over, R.rt.color[0]->d.width, R.rt.color[0]->d.height, R.rt.color[0]->d.format);
+    if (R.rt.color[0]->d.width == 960 && R.rt.color[0]->d.height == 720) half_add(pr->sh[1]->key, R.rt.color[0]->d.format);
     if (R.rt.color[0]->d.width < 640) return;
     mask_key_add(pr->sh[1]->key);
     if (lines <= 0) return;
@@ -9683,11 +9749,23 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         g_zskip_count++; { static int once; if (!once++) MLOG("零源跳过：首例 通道 %llu", g_stat_pass + 1); }
         PD("N %llu 零源跳过", g_stat_pass + 1); g_draw_skip[1]++; return; }
     unsigned tgt_w = atomic_load(&g_skiptgt_w), tgt_h = atomic_load(&g_skiptgt_h);
-    if (tgt_w && R.has_rt && R.rt.color[0] && R.rt.color[0]->d.width == tgt_w && R.rt.color[0]->d.height == tgt_h) {
-        static uint64_t logged, drops;
-        uint64_t fr = atomic_load(&g_cur_frame);
-        if (fr != logged) { if (logged && drops) MLOG("[skiptgt] frame %llu dropped %llu draws on %ux%u", (unsigned long long)logged, (unsigned long long)drops, tgt_w, tgt_h); logged = fr; drops = 0; }
-        drops++; return;
+    unsigned fmt_w = atomic_load(&g_skipfmt_w), fmt_h = atomic_load(&g_skipfmt_h), fmt = atomic_load(&g_skipfmt);
+    int half_key = atomic_load(&g_skip960_on) && pr && pr->sh[1] && !strncmp(pr->sh[1]->key, g_skip960, 16);
+    int size_hit = R.has_rt && R.rt.color[0] && ((tgt_w && R.rt.color[0]->d.width == tgt_w && R.rt.color[0]->d.height == tgt_h)
+        || (fmt_w && R.rt.color[0]->d.width == fmt_w && R.rt.color[0]->d.height == fmt_h && R.rt.color[0]->d.format == fmt)
+        || (half_key && R.rt.color[0]->d.width == 960 && R.rt.color[0]->d.height == 720));
+    if (size_hit) {
+        static uint64_t drops; static time_t stamped;
+        drops++;
+        time_t now = time(NULL);
+        if (now != stamped) {
+            stamped = now;
+            char line[180];
+            snprintf(line, sizeof line, "[skiptgt] dropped %llu draws on %ux%u fmt=%#x", (unsigned long long)drops,
+                R.rt.color[0]->d.width, R.rt.color[0]->d.height, R.rt.color[0]->d.format);
+            diag_status(line); drops = 0;
+        }
+        return;
     }
     if (atomic_load(&g_skippass) >= 0 && R.has_rt && R.rt.color[0] && R.rt.color[0]->d.width == 1920 && R.rt.color[0]->d.height == 1440
         && (!R.has_sc || (R.sc.x <= 0 && R.sc.y <= 0 && R.sc.w >= 1920 && R.sc.h >= 1440))) {
