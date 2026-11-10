@@ -2318,8 +2318,10 @@ static _Atomic int g_mask_frames;
 static _Atomic uint64_t g_mask_frame;
 static _Atomic unsigned g_skiptgt_w, g_skiptgt_h;
 static _Atomic unsigned g_skipfmt_w, g_skipfmt_h, g_skipfmt;
-static char g_skip960[17];
+static char g_skip960_keys[8][17];
 static _Atomic int g_skip960_on;
+static _Atomic int g_f207fix = 1;
+static int g_f207_dumped;
 static _Atomic int g_skippass = -1;
 static pthread_mutex_t g_diag_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_diag_ack[300];
@@ -2457,11 +2459,26 @@ void dm_gfx_set_flag(const char *name, int v) {
         diag_ack("[flag] skiptgt %ux%u %s (other sizes of the same shader still draw)", w, h, v ? "on" : "off"); return;
     }
     if (!strncmp(name, "skip960_", 8)) {
-        const char *p = name + 8; int n = (int)strlen(p);
-        if (!mask_skip_hex(p, n) || n != 16) { diag_ack("[flag] skip960 needs exactly 16 hex digits"); return; }
-        if (v) { for (int i = 0; i < 16; i++) g_skip960[i] = mask_skip_lower(p[i]); g_skip960[16] = 0; }
-        atomic_store(&g_skip960_on, v != 0);
-        diag_ack("[flag] skip960 %.16s %s (960x720 only)", p, v ? "on" : "off"); return;
+        const char *p = name + 8; int changed = 0;
+        if (!*p) { diag_ack("[flag] skip960 needs a 16-hex key"); return; }
+        while (*p) {
+            const char *comma = strchr(p, ','); int n = comma ? (int)(comma - p) : (int)strlen(p);
+            if (!mask_skip_hex(p, n) || n != 16) { diag_ack("[flag] skip960 needs 16 hex digits per key"); return; }
+            char key[17]; for (int i = 0; i < 16; i++) key[i] = mask_skip_lower(p[i]); key[16] = 0;
+            pthread_mutex_lock(&g_skip_mu);
+            int slot = -1; for (int i = 0; i < 8; i++) if (g_skip960_keys[i][0] && !strncmp(g_skip960_keys[i], key, 16)) slot = i;
+            if (v && slot < 0) { for (int i = 0; i < 8; i++) if (!g_skip960_keys[i][0]) { memcpy(g_skip960_keys[i], key, 17); slot = i; break; } }
+            if (!v && slot >= 0) g_skip960_keys[slot][0] = 0;
+            int on = 0; for (int i = 0; i < 8; i++) if (g_skip960_keys[i][0]) on = 1;
+            pthread_mutex_unlock(&g_skip_mu);
+            atomic_store(&g_skip960_on, on); changed++;
+            p = comma ? comma + 1 : p + n;
+        }
+        diag_ack("[flag] skip960 %s %s (%d keys, 960x720 only)", name + 8, v ? "on" : "off", changed); return;
+    }
+    if (!strcmp(name, "f207fix")) {
+        atomic_store(&g_f207fix, v != 0);
+        diag_ack("[flag] f207fix %d (960x720 RGBA8 draw of f207b1d79f3cc194 %s)", v != 0, v ? "not drawn" : "drawn"); return;
     }
     if (!strcmp(name, "skippass")) {
         if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
@@ -9750,7 +9767,38 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         PD("N %llu 零源跳过", g_stat_pass + 1); g_draw_skip[1]++; return; }
     unsigned tgt_w = atomic_load(&g_skiptgt_w), tgt_h = atomic_load(&g_skiptgt_h);
     unsigned fmt_w = atomic_load(&g_skipfmt_w), fmt_h = atomic_load(&g_skipfmt_h), fmt = atomic_load(&g_skipfmt);
-    int half_key = atomic_load(&g_skip960_on) && pr && pr->sh[1] && !strncmp(pr->sh[1]->key, g_skip960, 16);
+    int half_key = 0;
+    if (atomic_load(&g_skip960_on) && pr && pr->sh[1]) {
+        pthread_mutex_lock(&g_skip_mu);
+        for (int i = 0; i < 8; i++) if (g_skip960_keys[i][0] && !strncmp(pr->sh[1]->key, g_skip960_keys[i], 16)) half_key = 1;
+        pthread_mutex_unlock(&g_skip_mu);
+    }
+    int f207 = pr && pr->sh[1] && !strncmp(pr->sh[1]->key, "f207b1d79f3cc194", 16)
+        && R.has_rt && R.rt.color[0] && R.rt.color[0]->d.width == 960 && R.rt.color[0]->d.height == 720 && R.rt.color[0]->d.format == 0x25;
+    if (f207 && !g_f207_dumped) {
+        g_f207_dumped = 1;
+        const tex_t *ct = R.rt.color[0];
+        char body[1600]; size_t o = 0;
+        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d\n",
+            ct->d.width, ct->d.height, ct->d.format, R.rt.has_cview[0] && R.rt.cview[0].set_format ? R.rt.cview[0].format : -1, R.clear_c[0],
+            S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb, S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
+            S.chmask.mask, R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height);
+        registry_lock();
+        for (int r = 0; r < 8 && o + 140 < sizeof body; r++) {
+            int tid = (int)(S.tex[1][r] & 0xfffff); int sid = (int)(S.samp[1][r] >> 20); if (!sid) sid = (int)(S.tex[1][r] >> 20);
+            unsigned tw = 0, th = 0, tf = 0, ws = 0, wt = 0, wr = 0;
+            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { tw = g_treg[tid].t.d.width; th = g_treg[tid].t.d.height; tf = g_treg[tid].t.d.format; }
+            if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { ws = g_sreg[sid].ws; wt = g_sreg[sid].wt; wr = g_sreg[sid].wr; }
+            o += (size_t)snprintf(body + o, sizeof body - o, "[f207] r%d tex=%ux%u fmt=%#x wrap=%u/%u/%u\n", r, tw, th, tf, ws, wt, wr);
+        }
+        registry_unlock();
+        MLOG("%s", body); diag_append(body);
+    }
+    if (f207 && atomic_load(&g_f207fix)) {
+        static time_t stamped; time_t now = time(NULL);
+        if (now != stamped) { stamped = now; diag_status("[f207fix] 960x720 RGBA8 draw not run"); }
+        return;
+    }
     int size_hit = R.has_rt && R.rt.color[0] && ((tgt_w && R.rt.color[0]->d.width == tgt_w && R.rt.color[0]->d.height == tgt_h)
         || (fmt_w && R.rt.color[0]->d.width == fmt_w && R.rt.color[0]->d.height == fmt_h && R.rt.color[0]->d.format == fmt)
         || (half_key && R.rt.color[0]->d.width == 960 && R.rt.color[0]->d.height == 720));
