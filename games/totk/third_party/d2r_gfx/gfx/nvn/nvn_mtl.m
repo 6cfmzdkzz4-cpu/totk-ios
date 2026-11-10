@@ -2167,7 +2167,34 @@ static totk_serial_set g_dead_serial;   // serial -> (void *)1 once finalized
 static totk_serial_set g_gpu_owned;
 static _Atomic uint64_t g_owned_gen = 1;   // TOTK: bumped whenever a serial joins g_gpu_owned (entries are never removed)
 static void pkg_owned_locked(uint64_t k);
-static void gpu_owned_mark(uint64_t k) { pthread_mutex_lock(&g_smu); int had = totk_serial_has(&g_gpu_owned, k); if (!had) { totk_serial_add(&g_gpu_owned, k); atomic_fetch_add(&g_owned_gen, 1); pkg_owned_locked(k); } pthread_mutex_unlock(&g_smu);
+static struct { uint64_t serial, frame; uint8_t kind; } g_tex_touch[8192];
+static pthread_mutex_t g_tex_touch_mu = PTHREAD_MUTEX_INITIALIZER;
+static void tex_touch_note(uint64_t serial, uint8_t kind) {
+    if (!serial) return;
+    uint32_t i = (uint32_t)(serial * 0x9E3779B1u) & 8191u;
+    pthread_mutex_lock(&g_tex_touch_mu);
+    for (int n = 0; n < 8; n++) {
+        uint32_t s = (i + (uint32_t)n) & 8191u;
+        if (!g_tex_touch[s].serial || g_tex_touch[s].serial == serial) {
+            g_tex_touch[s].serial = serial; g_tex_touch[s].frame = atomic_load(&g_cur_frame); g_tex_touch[s].kind |= kind;
+            pthread_mutex_unlock(&g_tex_touch_mu); return;
+        }
+    }
+    pthread_mutex_unlock(&g_tex_touch_mu);
+}
+static int tex_touch_get(uint64_t serial, uint64_t *frame, uint8_t *kind) {
+    if (!serial) return 0;
+    uint32_t i = (uint32_t)(serial * 0x9E3779B1u) & 8191u;
+    pthread_mutex_lock(&g_tex_touch_mu);
+    for (int n = 0; n < 8; n++) {
+        uint32_t s = (i + (uint32_t)n) & 8191u;
+        if (g_tex_touch[s].serial == serial) { if (frame) *frame = g_tex_touch[s].frame; if (kind) *kind = g_tex_touch[s].kind; pthread_mutex_unlock(&g_tex_touch_mu); return 1; }
+        if (!g_tex_touch[s].serial) { pthread_mutex_unlock(&g_tex_touch_mu); return 0; }
+    }
+    pthread_mutex_unlock(&g_tex_touch_mu);
+    return 0;
+}
+static void gpu_owned_mark(uint64_t k) { pthread_mutex_lock(&g_smu); int had = totk_serial_has(&g_gpu_owned, k); if (!had) { totk_serial_add(&g_gpu_owned, k); atomic_fetch_add(&g_owned_gen, 1); pkg_owned_locked(k); } pthread_mutex_unlock(&g_smu); tex_touch_note(k, 2);
 }
 static int gpu_owned(uint64_t k) { pthread_mutex_lock(&g_smu); int d = totk_serial_has(&g_gpu_owned, k); pthread_mutex_unlock(&g_smu); return d; }
 
@@ -2320,7 +2347,8 @@ static _Atomic unsigned g_skiptgt_w, g_skiptgt_h;
 static _Atomic unsigned g_skipfmt_w, g_skipfmt_h, g_skipfmt;
 static char g_skip960_keys[8][17];
 static _Atomic int g_skip960_on;
-static _Atomic int g_f207fix = 1;
+static _Atomic int g_f207fix;
+static _Atomic int g_f207_border, g_f207_zero, g_f207_cmp, g_f207_neutral = -1;
 static int g_f207_dumped;
 static _Atomic int g_skippass = -1;
 static pthread_mutex_t g_diag_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2349,6 +2377,10 @@ static void diag_append(const char *line) {
     FILE *f = fopen(path, "a");
     if (f) { fputs(line, f); if (!line[0] || line[strlen(line) - 1] != '\n') fputc('\n', f); fclose(f); }
     pthread_mutex_unlock(&g_diag_mu);
+}
+static void diag_note(const char *fmt, ...) {
+    char line[300]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    MLOG("%s", line); diag_append(line);
 }
 static void diag_status(const char *line) {
     static time_t last; time_t now = time(NULL); if (now == last) return; last = now;
@@ -2478,7 +2510,15 @@ void dm_gfx_set_flag(const char *name, int v) {
     }
     if (!strcmp(name, "f207fix")) {
         atomic_store(&g_f207fix, v != 0);
-        diag_ack("[flag] f207fix %d (960x720 RGBA8 draw of f207b1d79f3cc194 %s)", v != 0, v ? "not drawn" : "drawn"); return;
+        diag_note("[flag] f207fix %d (off keeps the gloom visual; on skips that draw)", v != 0); return;
+    }
+    if (!strcmp(name, "f207dump")) { g_f207_dumped = 0; diag_note("[flag] f207dump armed"); return; }
+    if (!strcmp(name, "f207border")) { atomic_store(&g_f207_border, v != 0); diag_note("[flag] f207border %d (3D samplers on this draw use transparent-black clamp)", v != 0); return; }
+    if (!strcmp(name, "f207zero")) { atomic_store(&g_f207_zero, v != 0); diag_note("[flag] f207zero %d (never-written textures on this draw read zero)", v != 0); return; }
+    if (!strcmp(name, "f207cmp")) { atomic_store(&g_f207_cmp, v != 0); diag_note("[flag] f207cmp %d (depth textures on this draw compare less-equal)", v != 0); return; }
+    if (!strcmp(name, "f207slot")) {
+        if (v < -1 || v > 7) { diag_note("[flag] f207slot requires -1..7"); return; }
+        atomic_store(&g_f207_neutral, v); diag_note("[flag] f207slot %d (-1 off; 0..7 replaces that texture with zero)", v); return;
     }
     if (!strcmp(name, "skippass")) {
         if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
@@ -3420,6 +3460,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
         if (enc_ok) {
             [g_up_texs addObject:mt];
             if (!g_cb) up_flush();
+            if (mt && t->serial) tex_touch_note(t->serial, 1);
             return mt;
         }
         g_nup_blits = nb0; g_nup_decs = nd0; g_nup_tcas = nt0; g_nup_tcxs = nx0;   // 撤回本张已记的拷贝 / 解压：已编的解排布只写暂存区，无害；本张改走下面 CPU 路径 | Roll back the copies / decompressions already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
@@ -3427,7 +3468,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
         RED_ONCE(41, "预排布贴图 GPU 解排布不支持格式 %#x 目标 %d，回退 CPU", t->d.format, t->d.target);
     }
 
-    if (tck) { RED_ONCE(47, "BC 转码贴图的 GPU 上传失败（格式 %#x %ux%u）：这张贴图留空", t->d.format, t->d.width, t->d.height); return mt; }
+    if (tck) { RED_ONCE(47, "BC 转码贴图的 GPU 上传失败（格式 %#x %ux%u）：这张贴图留空", t->d.format, t->d.width, t->d.height); if (mt && t->serial) tex_touch_note(t->serial, 1); return mt; }
     if (tca) total = atotal;   // CPU path writes ASTC blocks (16 bytes) into the staging
     up_begin();
     up_reserve(total ? total : 16);
@@ -3483,6 +3524,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
        like the GPU-deswizzle path above. Committing per texture made ~20 command buffers and residency commits per frame
        and stalled the submit thread on the three upload allocators. */
     if (!g_cb) up_flush();
+    if (mt && t->serial) tex_touch_note(t->serial, 1);
     return mt;
 }
 // TOTK: which textures mirror their pool memory into the MTLTexture (upload at first use, re-upload on dirty pages).
@@ -5530,6 +5572,23 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
     if (s) { g_sview[sid] = (void *)CFBridgingRetain(s); g_srid[sid] = s.gpuResourceID._impl; }
     return s;
 }
+static id<MTLSamplerState> f207_extra_samp(int border, int compare) {
+    static void *hold[2];
+    int i = border ? 0 : 1;
+    if (hold[i]) return (__bridge id<MTLSamplerState>)hold[i];
+    MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+    d.minFilter = d.magFilter = MTLSamplerMinMagFilterLinear;
+    d.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    d.sAddressMode = d.tAddressMode = d.rAddressMode = border ? MTLSamplerAddressModeClampToBorderColor : MTLSamplerAddressModeClampToEdge;
+    d.borderColor = MTLSamplerBorderColorTransparentBlack;
+    if (compare) d.compareFunction = MTLCompareFunctionLessEqual;
+    d.supportArgumentBuffers = YES;
+    id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
+    if (s) hold[i] = (void *)CFBridgingRetain(s);
+    return s;
+}
+static id<MTLSamplerState> f207_border_samp(void) { return f207_extra_samp(1, 0); }
+static id<MTLSamplerState> f207_cmp_samp(void) { return f207_extra_samp(0, 1); }
 static inline __attribute__((always_inline)) void *samp_fast(int sid) {
     if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid] && g_sview[sid]) return g_sview[sid];
     return (__bridge void *)samp_by_id(sid);
@@ -6964,12 +7023,19 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         // Serialize with descriptor publication, as the full builder does. The
         // key precedes resource lookup: later changes cannot validate old bytes.
         registry_lock(); epoch = arg_epoch_current(nvn_stage);
+        if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)) {
+            unsigned bits = (unsigned)(atomic_load(&g_f207_border) & 1) | ((unsigned)(atomic_load(&g_f207_zero) & 1) << 1)
+                | ((unsigned)(atomic_load(&g_f207_cmp) & 1) << 2) | ((unsigned)(atomic_load(&g_f207_neutral) + 1) << 3);
+            epoch.config |= (uint64_t)bits << 16;
+        }
         if (g_arg_epoch_negative && sh->ab_buf) epoch.bindings = sh->ab_epoch.bindings;
         epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
         registry_unlock();
     }
     int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
+    if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)
+        && (atomic_load(&g_f207_border) || atomic_load(&g_f207_zero) || atomic_load(&g_f207_cmp) || atomic_load(&g_f207_neutral) >= 0)) reuse = 0;
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
         if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
@@ -7180,6 +7246,25 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         atomic_fetch_add_explicit(&g_tex_slots_hits, slot_hits, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_tex_slots_misses, slot_misses, memory_order_relaxed);
         if (slot_check) atomic_fetch_add_explicit(&g_tex_slots_verified, slot_hits, memory_order_relaxed);
+    }
+    if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)) {
+        int border = atomic_load(&g_f207_border), zero = atomic_load(&g_f207_zero), cmp = atomic_load(&g_f207_cmp), neutral = atomic_load(&g_f207_neutral);
+        if (border || zero || cmp || neutral >= 0) for (int i = 0; i < sh->rf.nb; i++) {
+            const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg, aid = b->aid;
+            if (reg < 0 || reg >= 128) continue;
+            int tid = (int)(S.tex[1][reg] & 0xfffff);
+            int ok = tid > 0 && tid < g_ntreg && g_treg[tid].ok;
+            int tgt = ok ? g_treg[tid].t.d.target : -1;
+            unsigned fm = ok ? g_treg[tid].t.d.format : 0;
+            if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ((neutral >= 0 && reg == neutral) || (zero && ok && !tex_touch_get(g_treg[tid].t.serial, NULL, NULL)))) {
+                id<MTLTexture> z = dummy_tex(b->dtt, b->dpf); slots[aid] = z ? z.gpuResourceID._impl : 0;
+            } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {
+                id<MTLSamplerState> repl = nil;
+                if (border && tgt == 2) repl = f207_border_samp();
+                if (cmp && fm >= 0x31 && fm <= 0x36) repl = f207_cmp_samp();
+                if (repl) slots[aid] = repl.gpuResourceID._impl;
+            }
+        }
     }
     registry_unlock();
     if (verify_epoch) {
@@ -9778,18 +9863,38 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (f207 && !g_f207_dumped) {
         g_f207_dumped = 1;
         const tex_t *ct = R.rt.color[0];
-        char body[1600]; size_t o = 0;
-        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d\n",
-            ct->d.width, ct->d.height, ct->d.format, R.rt.has_cview[0] && R.rt.cview[0].set_format ? R.rt.cview[0].format : -1, R.clear_c[0],
+        char body[3600]; size_t o = 0;
+        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d\n",
+            (unsigned long long)atomic_load(&g_cur_frame), ct->d.width, ct->d.height, ct->d.format, R.rt.has_cview[0] && R.rt.cview[0].set_format ? R.rt.cview[0].format : -1, R.clear_c[0],
             S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb, S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
-            S.chmask.mask, R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height);
+            S.chmask.mask, R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height,
+            atomic_load(&g_f207_border), atomic_load(&g_f207_zero), atomic_load(&g_f207_cmp), atomic_load(&g_f207_neutral));
         registry_lock();
-        for (int r = 0; r < 8 && o + 140 < sizeof body; r++) {
+        for (int r = 0; r < 8 && o + 320 < sizeof body; r++) {
             int tid = (int)(S.tex[1][r] & 0xfffff); int sid = (int)(S.samp[1][r] >> 20); if (!sid) sid = (int)(S.tex[1][r] >> 20);
-            unsigned tw = 0, th = 0, tf = 0, ws = 0, wt = 0, wr = 0;
-            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { tw = g_treg[tid].t.d.width; th = g_treg[tid].t.d.height; tf = g_treg[tid].t.d.format; }
-            if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { ws = g_sreg[sid].ws; wt = g_sreg[sid].wt; wr = g_sreg[sid].wr; }
-            o += (size_t)snprintf(body + o, sizeof body - o, "[f207] r%d tex=%ux%u fmt=%#x wrap=%u/%u/%u\n", r, tw, th, tf, ws, wt, wr);
+            unsigned tw = 0, th = 0, td = 0, tf = 0, tgt = 0, lv = 0, sr = 0, sg = 0, sb = 0, sa = 0;
+            uint64_t serial = 0, touched = 0; uint8_t kind = 0; int have = 0;
+            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
+                const treg_t *tr = &g_treg[tid]; have = 1;
+                tw = tr->t.d.width; th = tr->t.d.height; td = tr->t.d.depth; tf = tr->t.d.format; tgt = (unsigned)tr->t.d.target; lv = tr->t.d.levels; serial = tr->t.serial;
+                sr = tr->t.d.swizzle_r; sg = tr->t.d.swizzle_g; sb = tr->t.d.swizzle_b; sa = tr->t.d.swizzle_a;
+                if (tr->has_v && tr->v.set_swizzle) { sr = tr->v.swz[0]; sg = tr->v.swz[1]; sb = tr->v.swz[2]; sa = tr->v.swz[3]; }
+            }
+            int known = have && tex_touch_get(serial, &touched, &kind);
+            char how[32];
+            if (!known) snprintf(how, sizeof how, "never");
+            else snprintf(how, sizeof how, "%s%s%s", (kind & 1) ? "upload" : "", (kind & 2) ? (kind & 1) ? "+draw" : "draw" : "", (kind & 4) ? ((kind & 3) ? "+compute" : "compute") : "");
+            const char *ty = (tf >= 0x31 && tf <= 0x36) ? "depth" : tgt == 2 ? "3d" : tgt == 1 ? "2d" : tgt == 4 ? "2darray" : "other";
+            unsigned ws = 0, wt = 0, wr = 0, mag = 0, mn = 0, cm = 0, cf = 0;
+            float b0 = 0, b1 = 0, b2 = 0, b3 = 0, l0 = 0, l1 = 0;
+            if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
+                samp_par p = g_sreg[sid];
+                ws = p.ws; wt = p.wt; wr = p.wr; mag = p.magf; mn = p.minf; cm = p.cmp_mode; cf = p.cmp_func;
+                b0 = p.border[0]; b1 = p.border[1]; b2 = p.border[2]; b3 = p.border[3]; l0 = p.lod_min; l1 = p.lod_max;
+            }
+            o += (size_t)snprintf(body + o, sizeof body - o,
+                "[f207] r%d %s %ux%ux%u fmt=%#x tgt=%u lv=%u swz=%u%u%u%u ser=%llu wrap=%u/%u/%u border=%.3g,%.3g,%.3g,%.3g mag=%u min=%u cmp=%u/%u lod=%.3g..%.3g touch=%s@F%llu\n",
+                r, ty, tw, th, td, tf, tgt, lv, sr, sg, sb, sa, (unsigned long long)serial, ws, wt, wr, b0, b1, b2, b3, mag, mn, cm, cf, l0, l1, how, (unsigned long long)touched);
         }
         registry_unlock();
         MLOG("%s", body); diag_append(body);
@@ -10340,6 +10445,7 @@ static void dispatch(const p_dispatch *dp) {
             if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
                 const tex_t *t = &g_treg[tid].t;
                 mask_cs_add(t->d.width, t->d.height, t->d.format);
+                tex_touch_note(t->serial, 4);
                 mask_io_note("dispatch", cs->key, t->d.width, t->d.height, t->d.format, (unsigned)dp->x, (unsigned)dp->y);
             }
         }

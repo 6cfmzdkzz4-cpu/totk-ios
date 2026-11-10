@@ -44,7 +44,10 @@ class MaskDraw(unittest.TestCase):
         self.assertIn('%ux%u_fmt%x', MTL)
         self.assertIn('skip960_', MTL)
         self.assertIn('strchr(p, \',\')', MTL)
-        self.assertIn('g_f207fix = 1', MTL)
+        self.assertIn('static _Atomic int g_f207fix;', MTL)
+        self.assertNotIn('g_f207fix = 1', MTL)
+        for name in ('f207dump', 'f207border', 'f207zero', 'f207cmp', 'f207slot', 'tex_touch_note', 'f207_border_samp', 'f207_cmp_samp'):
+            self.assertIn(name, MTL)
         self.assertIn('f207b1d79f3cc194', MTL)
         self.assertIn('[mask-half] %.16s fmt=%#x x%u', MTL)
         self.assertIn('diag.txt', MTL)
