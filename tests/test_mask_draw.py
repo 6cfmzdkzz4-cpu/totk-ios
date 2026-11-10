@@ -37,6 +37,11 @@ class MaskDraw(unittest.TestCase):
         for name in ('skipfs_clear', 'skippre_', 'skipseen', 'skiphalf', 'skipkeep_', 'skipn'):
             self.assertIn(name, MTL)
         self.assertIn('[mask-io] frame %llu writes=%d', MTL)
+        self.assertIn('[mask-rt] F%llu %ux%u fmt=%#x draws=%u', MTL)
+        self.assertIn('[mask-cs] F%llu dispatches=0', MTL)
+        self.assertIn('[mask-draw] more %.16s x%u', MTL)
+        self.assertIn('skiptgt refuses 1920x1440', MTL)
+        self.assertIn('skippass', MTL)
         self.assertIn('mask_io_note("clear-rt"', MTL)
         drop = MTL.index('diag_fs_skipped(pr->sh[1]->key, scene_target)')
         gate = MTL[drop - 400:drop]

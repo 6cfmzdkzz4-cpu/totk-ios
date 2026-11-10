@@ -2316,6 +2316,8 @@ static int diag_shader_prefix_matches(const char *key, uint64_t value) {
 }
 static _Atomic int g_mask_frames;
 static _Atomic uint64_t g_mask_frame;
+static _Atomic unsigned g_skiptgt_w, g_skiptgt_h;
+static _Atomic int g_skippass = -1;
 void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "arg_epoch")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_on, v != 0); MLOG("[flag] arg_epoch = %d", v != 0); return; }
     if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
@@ -2406,6 +2408,18 @@ void dm_gfx_set_flag(const char *name, int v) {
         pthread_mutex_unlock(&g_skip_mu);
         MLOG("[flag] skipn %d census=%d scene=1920x1440 only (heaviest keys first; 0 off)", v, seen); return;
     }
+    if (!strncmp(name, "skiptgt_", 8)) {
+        unsigned w = 0, h = 0;
+        if (sscanf(name + 8, "%ux%u", &w, &h) != 2 || !w || !h || w > 8192 || h > 8192) { MLOG("[flag] skiptgt needs WxH, for example skiptgt_960x720"); return; }
+        if (w == 1920 && h == 1440) { MLOG("[flag] skiptgt refuses 1920x1440; that is the scene color target"); return; }
+        atomic_store(&g_skiptgt_w, v ? w : 0); atomic_store(&g_skiptgt_h, v ? h : 0);
+        MLOG("[flag] skiptgt %ux%u %s (other sizes of the same shader still draw)", w, h, v ? "on" : "off"); return;
+    }
+    if (!strcmp(name, "skippass")) {
+        if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
+        atomic_store(&g_skippass, v);
+        MLOG("[flag] skippass %d (fullscreen 1920x1440 draw index; -1 off; same-size input is copied through)", v); return;
+    }
     if (!strncmp(name, "skipkeep_", 9)) {
         const char *p = name + 9; int n = (int)strlen(p);
         if (!mask_skip_hex(p, n) || n != 16) { MLOG("[flag] skipkeep needs exactly 16 hex digits"); return; }
@@ -2430,7 +2444,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "mask_draw")) {
         atomic_store(&g_mask_frames, v ? 1 : 0); atomic_store(&g_mask_frame, 0);
         atomic_store(&g_mask_io_left, v ? 48 : 0); g_mask_io_notes = 0;
-        MLOG("[flag] mask_draw = %d (one scene frame; key list is heaviest first. [mask-io] frame writes=N follows it, including 0. Sampling unchanged)", v != 0); return;
+        MLOG("[flag] mask_draw = %d (one scene frame; [mask-rt] and [mask-cs] list every target size. Sampling unchanged)", v != 0); return;
     }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
@@ -9546,9 +9560,18 @@ void mtl_shader_miss_window(char *buf, size_t cap) {
 __attribute__((weak)) float dm_bright_k(void);
 /* One scene frame. The first 48 draws keep sampler, swizzle, and blend detail. Every fragment key on that
    target is counted, including draws after those 48 lines. No texels and no shader bytes. Sampling is unchanged. */
-static struct { char key[17]; unsigned n; } g_mask_keys[64];
-static int g_mask_nkeys, g_mask_extra;
+static struct { char key[17]; unsigned n; } g_mask_keys[64], g_mask_more[16];
+static int g_mask_nkeys, g_mask_more_n, g_mask_extra;
 static unsigned g_mask_draws;
+typedef struct { unsigned w, h, fmt, n; } mask_hist;
+static mask_hist g_rt_hist[24], g_cs_hist[16];
+static int g_rt_n, g_rt_over, g_cs_n, g_cs_over;
+static void hist_add(mask_hist *slot, int *n, int cap, int *over, unsigned w, unsigned h, unsigned fmt) {
+    for (int i = 0; i < *n; i++) if (slot[i].w == w && slot[i].h == h && slot[i].fmt == fmt) { slot[i].n++; return; }
+    if (*n >= cap) { (*over)++; return; }
+    slot[*n].w = w; slot[*n].h = h; slot[*n].fmt = fmt; slot[*n].n = 1; (*n)++;
+}
+static void mask_cs_add(unsigned w, unsigned h, unsigned fmt) { if (atomic_load(&g_mask_frames) > 0) hist_add(g_cs_hist, &g_cs_n, 16, &g_cs_over, w, h, fmt); }
 static void mask_keys_flush(uint64_t fr) {
     if (!g_mask_draws) return;
     for (int i = 1; i < g_mask_nkeys; i++) for (int j = i; j > 0 && g_mask_keys[j].n > g_mask_keys[j - 1].n; j--) {
@@ -9558,34 +9581,54 @@ static void mask_keys_flush(uint64_t fr) {
     }
     MLOG("[mask-draw] keys F%llu draws=%u unique=%d omitted=%d", (unsigned long long)fr, g_mask_draws, g_mask_nkeys, g_mask_extra);
     for (int i = 0; i < g_mask_nkeys; i++) MLOG("[mask-draw] key %.16s x%u", g_mask_keys[i].key, g_mask_keys[i].n);
+    for (int i = 1; i < g_mask_more_n; i++) for (int j = i; j > 0 && g_mask_more[j].n > g_mask_more[j - 1].n; j--) {
+        char key[17]; unsigned n = g_mask_more[j].n; memcpy(key, g_mask_more[j].key, 17);
+        memcpy(g_mask_more[j].key, g_mask_more[j - 1].key, 17); g_mask_more[j].n = g_mask_more[j - 1].n;
+        memcpy(g_mask_more[j - 1].key, key, 17); g_mask_more[j - 1].n = n;
+    }
+    for (int i = 0; i < g_mask_more_n; i++) MLOG("[mask-draw] more %.16s x%u", g_mask_more[i].key, g_mask_more[i].n);
+    for (int i = 0; i < g_rt_n; i++) MLOG("[mask-rt] F%llu %ux%u fmt=%#x draws=%u", (unsigned long long)fr, g_rt_hist[i].w, g_rt_hist[i].h, g_rt_hist[i].fmt, g_rt_hist[i].n);
+    if (g_rt_over) MLOG("[mask-rt] F%llu +%d sizes", (unsigned long long)fr, g_rt_over);
+    for (int i = 0; i < g_cs_n; i++) MLOG("[mask-cs] F%llu %ux%u fmt=%#x dispatches=%u", (unsigned long long)fr, g_cs_hist[i].w, g_cs_hist[i].h, g_cs_hist[i].fmt, g_cs_hist[i].n);
+    if (g_cs_over) MLOG("[mask-cs] F%llu +%d sizes", (unsigned long long)fr, g_cs_over);
+    if (!g_cs_n && !g_cs_over) MLOG("[mask-cs] F%llu dispatches=0", (unsigned long long)fr);
     MLOG("[mask-io] frame %llu writes=%d", (unsigned long long)fr, g_mask_io_notes);
     g_mask_io_notes = 0;
     pthread_mutex_lock(&g_skip_mu);
     g_skip.nseen = g_mask_nkeys;
     for (int i = 0; i < g_mask_nkeys; i++) memcpy(g_skip.seen[i], g_mask_keys[i].key, 17);
     pthread_mutex_unlock(&g_skip_mu);
-    g_mask_nkeys = 0; g_mask_extra = 0; g_mask_draws = 0;
+    g_mask_nkeys = g_mask_more_n = g_mask_extra = 0; g_mask_draws = 0;
+    g_rt_n = g_rt_over = g_cs_n = g_cs_over = 0;
 }
 static void mask_key_add(const char *key) {
     g_mask_draws++;
     for (int i = 0; i < g_mask_nkeys; i++) if (!strncmp(g_mask_keys[i].key, key, 16)) { g_mask_keys[i].n++; return; }
-    if (g_mask_nkeys >= 64) { g_mask_extra++; return; }
+    if (g_mask_nkeys >= 64) {
+        g_mask_extra++;
+        for (int i = 0; i < g_mask_more_n; i++) if (!strncmp(g_mask_more[i].key, key, 16)) { g_mask_more[i].n++; return; }
+        if (g_mask_more_n < 16) { snprintf(g_mask_more[g_mask_more_n].key, 17, "%.16s", key); g_mask_more[g_mask_more_n].n = 1; g_mask_more_n++; }
+        return;
+    }
     snprintf(g_mask_keys[g_mask_nkeys].key, sizeof g_mask_keys[g_mask_nkeys].key, "%.16s", key);
     g_mask_keys[g_mask_nkeys].n = 1; g_mask_nkeys++;
 }
 static void mask_draw_note(NvProg *pr) {
     if (atomic_load(&g_mask_frames) <= 0 || !pr || !pr->sh[1] || !pr->sh[1]->key[0]) return;
-    if (!R.has_rt || !R.rt.n || !R.rt.color[0] || R.rt.color[0]->d.width < 640) return;
+    if (!R.has_rt || !R.rt.n || !R.rt.color[0]) return;
     uint64_t fr = atomic_load(&g_cur_frame);
+    if (!atomic_load(&g_mask_frame) && R.rt.color[0]->d.width < 640) return;
     static int lines;
     if (fr != atomic_load(&g_mask_frame)) {
         uint64_t prev = atomic_load(&g_mask_frame);
         if (prev) mask_keys_flush(prev);
-        else { g_mask_nkeys = 0; g_mask_extra = 0; g_mask_draws = 0; }
+        else { g_mask_nkeys = g_mask_more_n = g_mask_extra = 0; g_mask_draws = 0; g_rt_n = g_rt_over = g_cs_n = g_cs_over = 0; }
         if (prev && atomic_fetch_sub(&g_mask_frames, 1) - 1 <= 0) return;
         atomic_store(&g_mask_frame, fr); lines = 48;
         MLOG("[mask-draw] frame %llu bright=%.3f", (unsigned long long)fr, dm_bright_k());
     }
+    hist_add(g_rt_hist, &g_rt_n, 24, &g_rt_over, R.rt.color[0]->d.width, R.rt.color[0]->d.height, R.rt.color[0]->d.format);
+    if (R.rt.color[0]->d.width < 640) return;
     mask_key_add(pr->sh[1]->key);
     if (lines <= 0) return;
     lines--;
@@ -9639,6 +9682,32 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (zskip_can_draw(pr)) {   // 零源跳过：输出恒为 0、写 0 盖 0，这次绘制不改变任何结果（见 zskip_can_draw） | Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("零源跳过：首例 通道 %llu", g_stat_pass + 1); }
         PD("N %llu 零源跳过", g_stat_pass + 1); g_draw_skip[1]++; return; }
+    unsigned tgt_w = atomic_load(&g_skiptgt_w), tgt_h = atomic_load(&g_skiptgt_h);
+    if (tgt_w && R.has_rt && R.rt.color[0] && R.rt.color[0]->d.width == tgt_w && R.rt.color[0]->d.height == tgt_h) {
+        static uint64_t logged, drops;
+        uint64_t fr = atomic_load(&g_cur_frame);
+        if (fr != logged) { if (logged && drops) MLOG("[skiptgt] frame %llu dropped %llu draws on %ux%u", (unsigned long long)logged, (unsigned long long)drops, tgt_w, tgt_h); logged = fr; drops = 0; }
+        drops++; return;
+    }
+    if (atomic_load(&g_skippass) >= 0 && R.has_rt && R.rt.color[0] && R.rt.color[0]->d.width == 1920 && R.rt.color[0]->d.height == 1440
+        && (!R.has_sc || (R.sc.x <= 0 && R.sc.y <= 0 && R.sc.w >= 1920 && R.sc.h >= 1440))) {
+        static uint64_t frame, logged; static int index;
+        uint64_t fr = atomic_load(&g_cur_frame);
+        if (fr != frame) { frame = fr; index = 0; }
+        int which = atomic_load(&g_skippass), mine = index++ == which;
+        if (mine && pr && pr->sh[1]) {
+            int tid = (int)(S.tex[1][0] & 0xfffff), copied = 0;
+            id<MTLTexture> dst = tex_mtl(R.rt.color[0]), src = nil;
+            if (tid > 0) { registry_lock(); src = tex_by_id(tid); registry_unlock(); }
+            if (src && dst && src != dst && src.width == dst.width && src.height == dst.height && src.pixelFormat == dst.pixelFormat) {
+                id<MTL4ComputeCommandEncoder> b = blit();
+                enc_b_copy_texture(b, src, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(src.width, src.height, 1), dst, 0, 0, MTLOriginMake(0, 0, 0));
+                copied = 1;
+            }
+            if (logged != fr) { logged = fr; MLOG("[skippass] frame %llu index %d %s fs=%.16s", (unsigned long long)fr, which, copied ? "passthrough" : "dropped", pr->sh[1]->key); }
+            return;
+        }
+    }
     int scene_target = R.has_rt && R.rt.n && R.rt.color[0] && R.rt.color[0]->d.width == 1920 && R.rt.color[0]->d.height == 1440;
     if (pr && pr->sh[1] && diag_fs_skipped(pr->sh[1]->key, scene_target)) {
         static uint64_t logged_frame, drops;
@@ -10138,12 +10207,13 @@ static void dispatch(const p_dispatch *dp) {
     if (cpr->missing) { static uint64_t n; if (!n++) MLOG("[shader-miss] 计算着色器还没翻译：跳过这个派发（以后同类不再提示）"); return; }
     NvShader *cs = cpr->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
-    if (atomic_load(&g_mask_io_left) > 0) {
+    if (atomic_load(&g_mask_frames) > 0 || atomic_load(&g_mask_io_left) > 0) {
         registry_lock();
         for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == NVN_RB_IMG && cs->rf.b[i].reg < 32) {
             int tid = (int)(S.img[5][cs->rf.b[i].reg] & 0xfffff);
             if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
                 const tex_t *t = &g_treg[tid].t;
+                mask_cs_add(t->d.width, t->d.height, t->d.format);
                 mask_io_note("dispatch", cs->key, t->d.width, t->d.height, t->d.format, (unsigned)dp->x, (unsigned)dp->y);
             }
         }
