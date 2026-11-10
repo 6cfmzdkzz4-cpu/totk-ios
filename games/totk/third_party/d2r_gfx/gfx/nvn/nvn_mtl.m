@@ -2194,6 +2194,21 @@ static int tex_touch_get(uint64_t serial, uint64_t *frame, uint8_t *kind) {
     pthread_mutex_unlock(&g_tex_touch_mu);
     return 0;
 }
+static id<MTLTexture> g_scene_depth;
+static uint64_t g_scene_serial;
+static unsigned g_scene_dw, g_scene_dh;
+static uint64_t g_scene_dframe;
+static int g_scene_score;
+static void scene_depth_note(id<MTLTexture> dt, uint64_t serial) {
+    if (serial) tex_touch_note(serial, 2);
+    if (!dt || dt.textureType != MTLTextureType2D) return;
+    if (dt.pixelFormat != MTLPixelFormatDepth32Float && dt.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 && dt.pixelFormat != MTLPixelFormatDepth16Unorm) return;
+    if (dt.width < 640 || dt.width == dt.height) return;
+    int score = (int)dt.width * (int)dt.height + (dt.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? 1 << 30 : 0);
+    if (!g_scene_depth || score > g_scene_score) {
+        g_scene_depth = dt; g_scene_serial = serial; g_scene_dw = (unsigned)dt.width; g_scene_dh = (unsigned)dt.height; g_scene_score = score; g_scene_dframe = atomic_load(&g_cur_frame);
+    }
+}
 static void gpu_owned_mark(uint64_t k) { pthread_mutex_lock(&g_smu); int had = totk_serial_has(&g_gpu_owned, k); if (!had) { totk_serial_add(&g_gpu_owned, k); atomic_fetch_add(&g_owned_gen, 1); pkg_owned_locked(k); } pthread_mutex_unlock(&g_smu); tex_touch_note(k, 2);
 }
 static int gpu_owned(uint64_t k) { pthread_mutex_lock(&g_smu); int d = totk_serial_has(&g_gpu_owned, k); pthread_mutex_unlock(&g_smu); return d; }
@@ -2349,6 +2364,7 @@ static char g_skip960_keys[8][17];
 static _Atomic int g_skip960_on;
 static _Atomic int g_f207fix;
 static _Atomic int g_f207_border, g_f207_zero, g_f207_cmp, g_f207_neutral = -1;
+static _Atomic int g_f207_depth = 1;
 static int g_f207_dumped;
 static _Atomic int g_skippass = -1;
 static pthread_mutex_t g_diag_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2519,6 +2535,11 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "f207slot")) {
         if (v < -1 || v > 7) { diag_note("[flag] f207slot requires -1..7"); return; }
         atomic_store(&g_f207_neutral, v); diag_note("[flag] f207slot %d (-1 off; 0..7 replaces that texture with zero)", v); return;
+    }
+    if (!strcmp(name, "f207depth")) {
+        if (v < 0 || v > 2) { diag_note("[flag] f207depth requires 0..2"); return; }
+        atomic_store(&g_f207_depth, v);
+        diag_note("[flag] f207depth %d (0 game depth; 1 scene depth on the gloom slot; 2 scene depth only if that texture was never written)", v); return;
     }
     if (!strcmp(name, "skippass")) {
         if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
@@ -4509,6 +4530,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         attach(pd.depthAttachment, R.rt.depth, &R.rt.dview, R.rt.has_dview);
         if (pd.depthAttachment.texture) {
             any = 1;
+            scene_depth_note(pd.depthAttachment.texture, R.rt.depth->serial);
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
             pd.depthAttachment.clearDepth = pd.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth16Unorm ? nvn_depth16_clear_value(R.cd) : R.cd;
             pd.depthAttachment.storeAction = MTLStoreActionStore;
@@ -7010,6 +7032,14 @@ static int tex_slots_diagnostics(void) {
     if (active < 0) active = getenv("DM_NVN_TEXPNG_FS") != NULL || getenv("DM_NVN_FLASHHDR") != NULL;
     return active;
 }
+static int f207_depth_replaces(int reg, unsigned fmt, uint64_t serial) {
+    int mode = atomic_load(&g_f207_depth);
+    if (mode <= 0 || !g_scene_depth || fmt < 0x32 || fmt > 0x36) return 0;
+    if (R.rt.depth && g_scene_serial && R.rt.depth->serial == g_scene_serial) return 0;
+    int wrote = serial && tex_touch_get(serial, NULL, NULL);
+    if (mode == 2) return !wrote;
+    return reg == 2 || !wrote;
+}
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
     if (nvn_stage == 1 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR") && R.rt.n && R.rt.color[0])
@@ -7027,6 +7057,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             unsigned bits = (unsigned)(atomic_load(&g_f207_border) & 1) | ((unsigned)(atomic_load(&g_f207_zero) & 1) << 1)
                 | ((unsigned)(atomic_load(&g_f207_cmp) & 1) << 2) | ((unsigned)(atomic_load(&g_f207_neutral) + 1) << 3);
             epoch.config |= (uint64_t)bits << 16;
+            epoch.config |= (uint64_t)((unsigned)atomic_load(&g_f207_depth) & 7u) << 24;
         }
         if (g_arg_epoch_negative && sh->ab_buf) epoch.bindings = sh->ab_epoch.bindings;
         epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
@@ -7035,7 +7066,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)
-        && (atomic_load(&g_f207_border) || atomic_load(&g_f207_zero) || atomic_load(&g_f207_cmp) || atomic_load(&g_f207_neutral) >= 0)) reuse = 0;
+        && (atomic_load(&g_f207_border) || atomic_load(&g_f207_zero) || atomic_load(&g_f207_cmp) || atomic_load(&g_f207_neutral) >= 0 || atomic_load(&g_f207_depth))) reuse = 0;
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
         if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
@@ -7248,15 +7279,17 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         if (slot_check) atomic_fetch_add_explicit(&g_tex_slots_verified, slot_hits, memory_order_relaxed);
     }
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)) {
-        int border = atomic_load(&g_f207_border), zero = atomic_load(&g_f207_zero), cmp = atomic_load(&g_f207_cmp), neutral = atomic_load(&g_f207_neutral);
-        if (border || zero || cmp || neutral >= 0) for (int i = 0; i < sh->rf.nb; i++) {
+        int border = atomic_load(&g_f207_border), zero = atomic_load(&g_f207_zero), cmp = atomic_load(&g_f207_cmp), neutral = atomic_load(&g_f207_neutral), depth = atomic_load(&g_f207_depth);
+        if (border || zero || cmp || neutral >= 0 || depth) for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg, aid = b->aid;
             if (reg < 0 || reg >= 128) continue;
             int tid = (int)(S.tex[1][reg] & 0xfffff);
             int ok = tid > 0 && tid < g_ntreg && g_treg[tid].ok;
             int tgt = ok ? g_treg[tid].t.d.target : -1;
             unsigned fm = ok ? g_treg[tid].t.d.format : 0;
-            if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ((neutral >= 0 && reg == neutral) || (zero && ok && !tex_touch_get(g_treg[tid].t.serial, NULL, NULL)))) {
+            if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && f207_depth_replaces(reg, fm, g_treg[tid].t.serial)) {
+                slots[aid] = g_scene_depth.gpuResourceID._impl;
+            } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ((neutral >= 0 && reg == neutral) || (zero && ok && !tex_touch_get(g_treg[tid].t.serial, NULL, NULL)))) {
                 id<MTLTexture> z = dummy_tex(b->dtt, b->dpf); slots[aid] = z ? z.gpuResourceID._impl : 0;
             } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {
                 id<MTLSamplerState> repl = nil;
@@ -9864,13 +9897,14 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         g_f207_dumped = 1;
         const tex_t *ct = R.rt.color[0];
         char body[3600]; size_t o = 0;
-        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d\n",
+        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d depth=%d scene=%ux%u@F%llu\n",
             (unsigned long long)atomic_load(&g_cur_frame), ct->d.width, ct->d.height, ct->d.format, R.rt.has_cview[0] && R.rt.cview[0].set_format ? R.rt.cview[0].format : -1, R.clear_c[0],
             S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb, S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
             S.chmask.mask, R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height,
-            atomic_load(&g_f207_border), atomic_load(&g_f207_zero), atomic_load(&g_f207_cmp), atomic_load(&g_f207_neutral));
+            atomic_load(&g_f207_border), atomic_load(&g_f207_zero), atomic_load(&g_f207_cmp), atomic_load(&g_f207_neutral), atomic_load(&g_f207_depth),
+            g_scene_dw, g_scene_dh, (unsigned long long)g_scene_dframe);
         registry_lock();
-        for (int r = 0; r < 8 && o + 320 < sizeof body; r++) {
+        for (int r = 0; r < 8 && o + 400 < sizeof body; r++) {
             int tid = (int)(S.tex[1][r] & 0xfffff); int sid = (int)(S.samp[1][r] >> 20); if (!sid) sid = (int)(S.tex[1][r] >> 20);
             unsigned tw = 0, th = 0, td = 0, tf = 0, tgt = 0, lv = 0, sr = 0, sg = 0, sb = 0, sa = 0;
             uint64_t serial = 0, touched = 0; uint8_t kind = 0; int have = 0;
@@ -9881,9 +9915,15 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                 if (tr->has_v && tr->v.set_swizzle) { sr = tr->v.swz[0]; sg = tr->v.swz[1]; sb = tr->v.swz[2]; sa = tr->v.swz[3]; }
             }
             int known = have && tex_touch_get(serial, &touched, &kind);
-            char how[32];
+            char how[40];
             if (!known) snprintf(how, sizeof how, "never");
-            else snprintf(how, sizeof how, "%s%s%s", (kind & 1) ? "upload" : "", (kind & 2) ? (kind & 1) ? "+draw" : "draw" : "", (kind & 4) ? ((kind & 3) ? "+compute" : "compute") : "");
+            else {
+                size_t u = 0; how[0] = 0;
+                const char *parts[] = {"upload", "draw", "compute", "clear"};
+                int bits[] = {1, 2, 4, 8};
+                for (int i = 0; i < 4 && u + 1 < sizeof how; i++) if (kind & bits[i]) u += (size_t)snprintf(how + u, sizeof how - u, "%s%s", u ? "+" : "", parts[i]);
+                if (!u) snprintf(how, sizeof how, "other");
+            }
             const char *ty = (tf >= 0x31 && tf <= 0x36) ? "depth" : tgt == 2 ? "3d" : tgt == 1 ? "2d" : tgt == 4 ? "2darray" : "other";
             unsigned ws = 0, wt = 0, wr = 0, mag = 0, mn = 0, cm = 0, cf = 0;
             float b0 = 0, b1 = 0, b2 = 0, b3 = 0, l0 = 0, l1 = 0;
@@ -9893,8 +9933,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                 b0 = p.border[0]; b1 = p.border[1]; b2 = p.border[2]; b3 = p.border[3]; l0 = p.lod_min; l1 = p.lod_max;
             }
             o += (size_t)snprintf(body + o, sizeof body - o,
-                "[f207] r%d %s %ux%ux%u fmt=%#x tgt=%u lv=%u swz=%u%u%u%u ser=%llu wrap=%u/%u/%u border=%.3g,%.3g,%.3g,%.3g mag=%u min=%u cmp=%u/%u lod=%.3g..%.3g touch=%s@F%llu\n",
-                r, ty, tw, th, td, tf, tgt, lv, sr, sg, sb, sa, (unsigned long long)serial, ws, wt, wr, b0, b1, b2, b3, mag, mn, cm, cf, l0, l1, how, (unsigned long long)touched);
+                "[f207] r%d %s %ux%ux%u fmt=%#x tgt=%u lv=%u swz=%u%u%u%u ser=%llu wrap=%u/%u/%u border=%.3g,%.3g,%.3g,%.3g mag=%u min=%u cmp=%u/%u lod=%.3g..%.3g touch=%s@F%llu alias=%d\n",
+                r, ty, tw, th, td, tf, tgt, lv, sr, sg, sb, sa, (unsigned long long)serial, ws, wt, wr, b0, b1, b2, b3, mag, mn, cm, cf, l0, l1, how, (unsigned long long)touched, f207_depth_replaces(r, tf, serial));
         }
         registry_unlock();
         MLOG("%s", body); diag_append(body);
@@ -10754,7 +10794,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 // Whole level and whole face, all four channels written -> open one clear-only render pass per layer / depth slice (the hardware converts the clear value by the texture format, including integer and depth);
 // view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
 static void clear_tex(const p_clear_tex *c) {
-    if (c->tex) { mask_io_note("clear", NULL, c->tex->d.width, c->tex->d.height, c->tex->d.format, (unsigned)c->r.width, (unsigned)c->r.height); zskip_del(c->tex->serial); }
+    if (c->tex) { mask_io_note("clear", NULL, c->tex->d.width, c->tex->d.height, c->tex->d.format, (unsigned)c->r.width, (unsigned)c->r.height); zskip_del(c->tex->serial); tex_touch_note(c->tex->serial, 8); }
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("X ser=%llu 视图格式 %#x 区域 %d,%d,%d %dx%dx%d 掩码 %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);
