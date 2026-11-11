@@ -48,7 +48,8 @@ class MaskDraw(unittest.TestCase):
         self.assertNotIn('g_f207fix = 1', MTL)
         self.assertIn('static _Atomic int g_f207_depth;', MTL)
         self.assertNotIn('g_f207_depth = 1', MTL)
-        for name in ('f207dump', 'f207border', 'f207zero', 'f207cmp', 'f207slot', 'f207depth', 'f207lod', 'f207vflip', 'f207fmt', 'f207const', 'f207view', 'f207save', 'tex_touch_note', 'f207_border_samp', 'f207_cmp_samp', 'f207_lod0_samp', 'scene_depth_note'):
+        self.assertIn('g_f207_inv = 1', MTL)
+        for name in ('f207dump', 'f207border', 'f207zero', 'f207cmp', 'f207slot', 'f207depth', 'f207lod', 'f207vflip', 'f207fmt', 'f207const', 'f207view', 'f207save', 'f207inv', 'f207_invert_depth', 'tex_touch_note', 'f207_border_samp', 'f207_cmp_samp', 'f207_lod0_samp', 'scene_depth_note'):
             self.assertIn(name, MTL)
         self.assertIn('f207b1d79f3cc194', MTL)
         self.assertIn('[mask-half] %.16s fmt=%#x x%u', MTL)

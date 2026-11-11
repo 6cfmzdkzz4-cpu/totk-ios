@@ -2369,6 +2369,8 @@ static _Atomic int g_f207fix;
 static _Atomic int g_f207_border, g_f207_zero, g_f207_cmp, g_f207_neutral = -1;
 static _Atomic int g_f207_depth;
 static _Atomic int g_f207_lod, g_f207_vflip, g_f207_fmt, g_f207_const, g_f207_view, g_f207_save;
+static _Atomic int g_f207_inv = 1;
+static id<MTLTexture> g_f207_inv_tex;
 static id<MTLTexture> g_f207_alt[2];
 static uint64_t g_f207_alt_ser[2];
 static int g_f207_alt_kind;
@@ -2567,6 +2569,7 @@ void dm_gfx_set_flag(const char *name, int v) {
         diag_note("[flag] f207view %d (0 gloom; 1 r0; 2 r1; 3 r2 depth; 4 r0 with V flipped)", v); return;
     }
     if (!strcmp(name, "f207save")) { atomic_store(&g_f207_save, v != 0); diag_note("[flag] f207save %d (write Documents/f207-r0.raw and f207-r1.raw once)", v != 0); return; }
+    if (!strcmp(name, "f207inv")) { atomic_store(&g_f207_inv, v != 0); diag_note("[flag] f207inv %d (1 feeds 1-depth into the gloom pass)", v != 0); return; }
     if (!strcmp(name, "skippass")) {
         if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
         atomic_store(&g_skippass, v);
@@ -7119,7 +7122,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)
         && (atomic_load(&g_f207_border) || atomic_load(&g_f207_zero) || atomic_load(&g_f207_cmp) || atomic_load(&g_f207_neutral) >= 0 || atomic_load(&g_f207_depth)
-            || atomic_load(&g_f207_lod) || atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const))) reuse = 0;
+            || atomic_load(&g_f207_lod) || atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_inv))) reuse = 0;
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
         if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
@@ -7333,8 +7336,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     }
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)) {
         int border = atomic_load(&g_f207_border), zero = atomic_load(&g_f207_zero), cmp = atomic_load(&g_f207_cmp), neutral = atomic_load(&g_f207_neutral), depth = atomic_load(&g_f207_depth);
-        int lod = atomic_load(&g_f207_lod), vflip = atomic_load(&g_f207_vflip), fmtp = atomic_load(&g_f207_fmt), cnst = atomic_load(&g_f207_const);
-        if (border || zero || cmp || neutral >= 0 || depth || lod || vflip || fmtp || cnst) for (int i = 0; i < sh->rf.nb; i++) {
+        int lod = atomic_load(&g_f207_lod), vflip = atomic_load(&g_f207_vflip), fmtp = atomic_load(&g_f207_fmt), cnst = atomic_load(&g_f207_const), inv = atomic_load(&g_f207_inv);
+        if (border || zero || cmp || neutral >= 0 || depth || lod || vflip || fmtp || cnst || inv) for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg, aid = b->aid;
             if (reg < 0 || reg >= 128) continue;
             int tid = (int)(S.tex[1][reg] & 0xfffff);
@@ -7343,6 +7346,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             unsigned fm = ok ? g_treg[tid].t.d.format : 0;
             if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && cnst && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_cdepth[cnst - 1]) {
                 slots[aid] = g_f207_cdepth[cnst - 1].gpuResourceID._impl;
+            } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && inv && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_inv_tex) {
+                slots[aid] = g_f207_inv_tex.gpuResourceID._impl;
             } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && (vflip || fmtp) && reg < 2 && g_f207_alt[reg] && g_f207_alt_ser[reg] == g_treg[tid].t.serial) {
                 slots[aid] = g_f207_alt[reg].gpuResourceID._impl;
             } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && f207_depth_replaces(reg, fm, g_treg[tid].t.serial)) {
@@ -9990,6 +9995,54 @@ static void f207_const_depth(int which) {
     enc_r_end(enc_r_begin(rp));
     g_f207_cdepth[which - 1] = t;
 }
+static void f207_invert_depth(void) {
+    id<MTLTexture> src = f207_bound(2);
+    if (g_rs_active) { static int once; if (!once++) diag_note("[f207inv] render stream is on"); return; }
+    if (!src || !src.width || !src.height) return;
+    if (src.pixelFormat != MTLPixelFormatDepth32Float && src.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 && src.pixelFormat != MTLPixelFormatDepth16Unorm) return;
+    if (g_enc) rp_end();
+    if (!g_f207_inv_tex || g_f207_inv_tex.width != src.width || g_f207_inv_tex.height != src.height) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:src.width height:src.height mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];
+        if (!t) return;
+        res_add(t); g_f207_inv_tex = t;
+    }
+    static id<MTLRenderPipelineState> ps; static id<MTL4ArgumentTable> at; static id<MTLDepthStencilState> dss;
+    if (!ps) {
+        NSError *e = nil;
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:
+            @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "vertex float4 f207i_vs(uint id [[vertex_id]]) { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2.0 - 1.0, 0.0, 1.0); }\n"
+            "struct O { float d [[depth(any)]]; };\n"
+            "fragment O f207i_fs(float4 p [[position]], depth2d<float> src [[texture(0)]]) {\n"
+            "  uint2 xy = uint2(p.xy); if (xy.x >= src.get_width()) xy.x = src.get_width() - 1; if (xy.y >= src.get_height()) xy.y = src.get_height() - 1;\n"
+            "  O o; o.d = 1.0 - src.read(xy); return o; }\n" options:nil error:&e];
+        if (!lib) { diag_note("[f207inv] shader failed"); return; }
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [lib newFunctionWithName:@"f207i_vs"]; d.fragmentFunction = [lib newFunctionWithName:@"f207i_fs"];
+        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        if (!ps) { diag_note("[f207inv] pipeline failed"); return; }
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1;
+        at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+        dss = [g_dev newDepthStencilStateWithDescriptor:dd];
+    }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.depthAttachment.texture = g_f207_inv_tex; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = 1;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> en = enc_r_begin(rp);
+    if (!en || !at) return;
+    [at setTexture:src.gpuResourceID atIndex:0];
+    [en setArgumentTable:at atStages:MTLRenderStageFragment];
+    [en setRenderPipelineState:ps]; [en setDepthStencilState:dss];
+    [en setViewport:(MTLViewport){0, 0, (double)src.width, (double)src.height, 0, 1}];
+    [en setCullMode:MTLCullModeNone];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    enc_r_end(en);
+}
 static void f207_prepare_alts(void) {
     int vflip = atomic_load(&g_f207_vflip), fmtp = atomic_load(&g_f207_fmt), cnst = atomic_load(&g_f207_const);
     int kind = vflip ? 1 : fmtp;
@@ -10006,6 +10059,7 @@ static void f207_prepare_alts(void) {
         if (dst && dst != src) { g_f207_alt[reg] = dst; g_f207_alt_ser[reg] = ser; }
     }
     if (cnst) f207_const_depth(cnst);
+    else if (atomic_load(&g_f207_inv)) f207_invert_depth();
 }
 static int f207_debug_draw(int mode) {
     if (g_rs_active) { diag_note("[f207view] render stream is on"); return 0; }
@@ -10070,6 +10124,17 @@ static void f207_save_maps(void) {
     for (int i = 0; i < 2; i++) {
         id<MTLTexture> t = f207_bound(i);
         if (!t) { diag_note("[f207save] r%d missing", i); continue; }
+        int tid = (int)(S.tex[1][i] & 0xfffff);
+        unsigned nvw = 0, nvh = 0, nvlv = 0, base = 0;
+        if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
+            nvw = g_treg[tid].t.d.width; nvh = g_treg[tid].t.d.height; nvlv = g_treg[tid].t.d.levels;
+            if (g_treg[tid].has_v && g_treg[tid].v.set_levels) base = g_treg[tid].v.base_level;
+        }
+        id<MTLTexture> parent = t.parentTexture;
+        diag_note("[f207save] r%d nvn=%ux%u lv=%u base=%u metal=%lux%lu mips=%lu parent=%lux%lu rel=%lu fmt=%lu",
+            i, nvw, nvh, nvlv, base, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.mipmapLevelCount,
+            parent ? (unsigned long)parent.width : 0ul, parent ? (unsigned long)parent.height : 0ul,
+            parent ? (unsigned long)t.parentRelativeLevel : 0ul, (unsigned long)t.pixelFormat);
         NSUInteger bpp = 4;
         if (t.pixelFormat == MTLPixelFormatR16Unorm || t.pixelFormat == MTLPixelFormatR16Snorm || t.pixelFormat == MTLPixelFormatR16Float || t.pixelFormat == MTLPixelFormatRG8Unorm || t.pixelFormat == MTLPixelFormatRG8Snorm) bpp = 2;
         NSUInteger row = (t.width * bpp + 255u) & ~255u, w = t.width, h = t.height, pf = t.pixelFormat;
@@ -10175,7 +10240,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         if (now != stamped) { stamped = now; diag_status("[f207fix] 960x720 RGBA8 draw not run"); }
         return;
     }
-    if (f207 && (atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_save) || atomic_load(&g_f207_view))) {
+    if (f207 && (atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_save) || atomic_load(&g_f207_view) || atomic_load(&g_f207_inv))) {
         f207_prepare_alts();
         f207_save_maps();
         int view = atomic_load(&g_f207_view);
