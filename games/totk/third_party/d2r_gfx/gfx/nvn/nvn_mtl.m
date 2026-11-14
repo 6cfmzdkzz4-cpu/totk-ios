@@ -2370,9 +2370,12 @@ static _Atomic int g_f207_border, g_f207_zero, g_f207_cmp, g_f207_neutral = -1;
 static _Atomic int g_f207_depth;
 static _Atomic int g_f207_lod, g_f207_vflip, g_f207_fmt, g_f207_const, g_f207_view, g_f207_save;
 static _Atomic int g_f207_inv;
-/* Thousandths. near: d' = d + k*(1-d)^2 (0 off, 1000 full). Far pixels stay put; only the camera shell moves.
-   floor: d' = max(d', floor) (0 off). 1000 is the old constant far=1, which also rewrote the distance. */
+/* Thousandths. near: curve strength k (0 off, 1000 the Diagnostic42 tighter shell, up to 16000).
+   exp: curve power (2000 is the square). push: view-distance added in near-planes (0 off) before the curve.
+   floor: d' = max(d', floor). A hard floor made the shell worse on device; leave it at 0. */
 static _Atomic int g_f207_near = 1000;
+static _Atomic int g_f207_exp = 2000;
+static _Atomic int g_f207_push;
 static _Atomic int g_f207_floor;
 static _Atomic int g_fxquad = 1, g_fxwatch;
 static char g_fxskip[4][17];
@@ -2578,14 +2581,24 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "f207save")) { atomic_store(&g_f207_save, v != 0); diag_note("[flag] f207save %d (write Documents/f207-r0.raw and f207-r1.raw once)", v != 0); return; }
     if (!strcmp(name, "f207inv")) { atomic_store(&g_f207_inv, v != 0); diag_note("[flag] f207inv %d (0 baseline; 1 feeds 1-depth, which paints the distance too)", v != 0); return; }
     if (!strcmp(name, "f207near")) {
-        if (v < 0 || v > 1000) { diag_note("[flag] f207near requires 0..1000"); return; }
+        if (v < 0 || v > 16000) { diag_note("[flag] f207near requires 0..16000"); return; }
         atomic_store(&g_f207_near, v);
-        diag_note("[flag] f207near %d (0 baseline; 1000 lifts only near depth, far stays)", v); return;
+        diag_note("[flag] f207near %d (0 off; 1000 tighter shell; higher saturates only the closest pixels at far)", v); return;
+    }
+    if (!strcmp(name, "f207exp")) {
+        if (v < 250 || v > 8000) { diag_note("[flag] f207exp requires 250..8000"); return; }
+        atomic_store(&g_f207_exp, v);
+        diag_note("[flag] f207exp %d (thousandths; 2000 square; 1000 linear; lower moves the remaining shell more)", v); return;
+    }
+    if (!strcmp(name, "f207push")) {
+        if (v < 0 || v > 100000) { diag_note("[flag] f207push requires 0..100000"); return; }
+        atomic_store(&g_f207_push, v);
+        diag_note("[flag] f207push %d (0 off; thousandths of a near-plane added to view distance before the curve)", v); return;
     }
     if (!strcmp(name, "f207floor")) {
         if (v < 0 || v > 1000) { diag_note("[flag] f207floor requires 0..1000"); return; }
         atomic_store(&g_f207_floor, v);
-        diag_note("[flag] f207floor %d (0 off; thousandths hard floor under the gloom depth; 1000 is constant far)", v); return;
+        diag_note("[flag] f207floor %d (0 off; thousandths hard floor; 990 spread the gloom on device)", v); return;
     }
     if (!strcmp(name, "fxquad")) { atomic_store(&g_fxquad, v != 0); diag_note("[flag] fxquad %d (1 draws indexed quads, fans and line loops)", v != 0); return; }
     if (!strcmp(name, "fxwatch")) { atomic_store(&g_fxwatch, v < 0 ? 0 : v); diag_note("[flag] fxwatch %d frames of effect draws", v < 0 ? 0 : v); return; }
@@ -7155,7 +7168,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)
         && (atomic_load(&g_f207_border) || atomic_load(&g_f207_zero) || atomic_load(&g_f207_cmp) || atomic_load(&g_f207_neutral) >= 0 || atomic_load(&g_f207_depth)
             || atomic_load(&g_f207_lod) || atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_inv)
-            || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor))) reuse = 0;
+            || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor) || atomic_load(&g_f207_push))) reuse = 0;
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
         if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
@@ -7370,8 +7383,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)) {
         int border = atomic_load(&g_f207_border), zero = atomic_load(&g_f207_zero), cmp = atomic_load(&g_f207_cmp), neutral = atomic_load(&g_f207_neutral), depth = atomic_load(&g_f207_depth);
         int lod = atomic_load(&g_f207_lod), vflip = atomic_load(&g_f207_vflip), fmtp = atomic_load(&g_f207_fmt), cnst = atomic_load(&g_f207_const), inv = atomic_load(&g_f207_inv);
-        int lift = atomic_load(&g_f207_near), depth_floor = atomic_load(&g_f207_floor);
-        if (border || zero || cmp || neutral >= 0 || depth || lod || vflip || fmtp || cnst || inv || lift || depth_floor) for (int i = 0; i < sh->rf.nb; i++) {
+        int lift = atomic_load(&g_f207_near), depth_floor = atomic_load(&g_f207_floor), depth_push = atomic_load(&g_f207_push);
+        if (border || zero || cmp || neutral >= 0 || depth || lod || vflip || fmtp || cnst || inv || lift || depth_floor || depth_push) for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg, aid = b->aid;
             if (reg < 0 || reg >= 128) continue;
             int tid = (int)(S.tex[1][reg] & 0xfffff);
@@ -7380,7 +7393,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             unsigned fm = ok ? g_treg[tid].t.d.format : 0;
             if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && cnst && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_cdepth[cnst - 1]) {
                 slots[aid] = g_f207_cdepth[cnst - 1].gpuResourceID._impl;
-            } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && (inv || lift || depth_floor) && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_inv_tex) {
+            } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && (inv || lift || depth_floor || depth_push) && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_inv_tex) {
                 slots[aid] = g_f207_inv_tex.gpuResourceID._impl;
             } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && (vflip || fmtp) && reg < 2 && g_f207_alt[reg] && g_f207_alt_ser[reg] == g_treg[tid].t.serial) {
                 slots[aid] = g_f207_alt[reg].gpuResourceID._impl;
@@ -10095,11 +10108,15 @@ static void f207_remap_depth(int invert) {
             @"#include <metal_stdlib>\nusing namespace metal;\n"
             "vertex float4 f207r_vs(uint id [[vertex_id]]) { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2.0 - 1.0, 0.0, 1.0); }\n"
             "struct O { float d [[depth(any)]]; };\n"
-            "struct U { int mode; float k; float floor; };\n"
+            "struct U { int mode; float k; float floor; float exp; float push; };\n"
             "fragment O f207r_fs(float4 p [[position]], depth2d<float> src [[texture(0)]], constant U& u [[buffer(0)]]) {\n"
             "  uint2 xy = uint2(p.xy); if (xy.x >= src.get_width()) xy.x = src.get_width() - 1; if (xy.y >= src.get_height()) xy.y = src.get_height() - 1;\n"
             "  float d = src.read(xy); float gap = 1.0 - d;\n"
-            "  O o; o.d = u.mode == 1 ? gap : max(d + gap * gap * u.k, u.floor); return o; }\n" options:nil error:&e];
+            "  if (u.mode == 1) { O o; o.d = gap; return o; }\n"
+            "  if (u.push != 0.0) gap = gap / (1.0 + u.push * gap);\n"
+            "  float curve = (u.exp == 2.0) ? gap * gap : pow(max(gap, 0.0), u.exp);\n"
+            "  gap = max(0.0, gap - u.k * curve);\n"
+            "  O o; o.d = saturate(max(1.0 - gap, u.floor)); return o; }\n" options:nil error:&e];
         if (!lib) { diag_note("[f207near] shader failed"); return; }
         MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
         d.vertexFunction = [lib newFunctionWithName:@"f207r_vs"]; d.fragmentFunction = [lib newFunctionWithName:@"f207r_fs"];
@@ -10111,17 +10128,19 @@ static void f207_remap_depth(int invert) {
         MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
         dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
         dss = [g_dev newDepthStencilStateWithDescriptor:dd];
-        params = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; res_add(params);
+        params = [g_dev newBufferWithLength:32 options:MTLResourceStorageModeShared]; res_add(params);
     }
     if (!params) return;
     int lift = atomic_load(&g_f207_near), depth_floor = atomic_load(&g_f207_floor);
-    static int logged_lift = -1, logged_floor = -1, logged_inv = -1;
-    if (lift != logged_lift || depth_floor != logged_floor || invert != logged_inv) {
-        logged_lift = lift; logged_floor = depth_floor; logged_inv = invert;
-        diag_note("[f207near] k=%d floor=%d inv=%d", lift, depth_floor, invert);
+    int curve_exp = atomic_load(&g_f207_exp), depth_push = atomic_load(&g_f207_push);
+    static int logged_lift = -1, logged_floor = -1, logged_inv = -1, logged_exp = -1, logged_push = -1;
+    if (lift != logged_lift || depth_floor != logged_floor || invert != logged_inv || curve_exp != logged_exp || depth_push != logged_push) {
+        logged_lift = lift; logged_floor = depth_floor; logged_inv = invert; logged_exp = curve_exp; logged_push = depth_push;
+        diag_note("[f207near] k=%d exp=%d push=%d floor=%d inv=%d", lift, curve_exp, depth_push, depth_floor, invert);
     }
     int *mode = params.contents; mode[0] = invert ? 1 : 0;
-    float *coeff = params.contents; coeff[1] = lift / 1000.0f; coeff[2] = depth_floor / 1000.0f;
+    float *coeff = params.contents;
+    coeff[1] = lift / 1000.0f; coeff[2] = depth_floor / 1000.0f; coeff[3] = curve_exp / 1000.0f; coeff[4] = depth_push / 1000.0f;
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.depthAttachment.texture = g_f207_inv_tex; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = 1;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
@@ -10152,7 +10171,7 @@ static void f207_prepare_alts(void) {
         if (dst && dst != src) { g_f207_alt[reg] = dst; g_f207_alt_ser[reg] = ser; }
     }
     if (cnst) f207_const_depth(cnst);
-    else if (atomic_load(&g_f207_inv) || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor)) f207_remap_depth(atomic_load(&g_f207_inv));
+    else if (atomic_load(&g_f207_inv) || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor) || atomic_load(&g_f207_push)) f207_remap_depth(atomic_load(&g_f207_inv));
 }
 static int f207_debug_draw(int mode) {
     if (g_rs_active) { diag_note("[f207view] render stream is on"); return 0; }
@@ -10432,13 +10451,13 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         g_f207_dumped = 1;
         const tex_t *ct = R.rt.color[0];
         char body[3600]; size_t o = 0;
-        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d depth=%d lod=%d vflip=%d fmtp=%d const=%d view=%d near=%d floor=%d inv=%d scene=%ux%u@F%llu\n",
+        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d depth=%d lod=%d vflip=%d fmtp=%d const=%d view=%d near=%d exp=%d push=%d floor=%d inv=%d scene=%ux%u@F%llu\n",
             (unsigned long long)atomic_load(&g_cur_frame), ct->d.width, ct->d.height, ct->d.format, R.rt.has_cview[0] && R.rt.cview[0].set_format ? R.rt.cview[0].format : -1, R.clear_c[0],
             S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb, S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
             S.chmask.mask, R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height,
             atomic_load(&g_f207_border), atomic_load(&g_f207_zero), atomic_load(&g_f207_cmp), atomic_load(&g_f207_neutral), atomic_load(&g_f207_depth),
             atomic_load(&g_f207_lod), atomic_load(&g_f207_vflip), atomic_load(&g_f207_fmt), atomic_load(&g_f207_const), atomic_load(&g_f207_view),
-            atomic_load(&g_f207_near), atomic_load(&g_f207_floor), atomic_load(&g_f207_inv),
+            atomic_load(&g_f207_near), atomic_load(&g_f207_exp), atomic_load(&g_f207_push), atomic_load(&g_f207_floor), atomic_load(&g_f207_inv),
             g_scene_dw, g_scene_dh, (unsigned long long)g_scene_dframe);
         registry_lock();
         for (int r = 0; r < 8 && o + 400 < sizeof body; r++) {
@@ -10484,7 +10503,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         if (now != stamped) { stamped = now; diag_status("[f207fix] 960x720 RGBA8 draw not run"); }
         return;
     }
-    if (f207 && (atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_save) || atomic_load(&g_f207_view) || atomic_load(&g_f207_inv) || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor))) {
+    if (f207 && (atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_save) || atomic_load(&g_f207_view) || atomic_load(&g_f207_inv) || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor) || atomic_load(&g_f207_push))) {
         f207_prepare_alts();
         f207_save_maps();
         int view = atomic_load(&g_f207_view);
