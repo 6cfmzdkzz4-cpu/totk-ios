@@ -35,7 +35,7 @@ class ModManifest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.romfs = fake_romfs(self.root/'romfs')
-        self.mod = self.root/'mods/v143'
+        self.mod = self.root/'mods/pack'
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -48,7 +48,7 @@ class ModManifest(unittest.TestCase):
         self.put('Sound/B.bwav', b'dubbed')
         self.put('UI/C.bfres', b'c')   # same as the original: left out
         self.put('.DS_Store', b'finder')
-        result = run(self.mod, '--romfs', self.romfs)
+        result = run(self.mod, '--romfs', self.romfs, '--version', 'v0')
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = [l for l in (self.mod/'manifest.tsv').read_text().splitlines() if not l.startswith('#')]
         self.assertEqual(lines, ['\t'.join(['Sound/B.bwav', '6', hashlib.sha256(b'dubbed').hexdigest(),
@@ -57,7 +57,7 @@ class ModManifest(unittest.TestCase):
 
     def test_misspelt_path_writes_nothing(self):
         self.put('Sound/b.bwav', b'wrong case')
-        result = run(self.mod, '--romfs', self.romfs)
+        result = run(self.mod, '--romfs', self.romfs, '--version', 'v0')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('not a file of this RomFS: Sound/b.bwav (it has Sound/B.bwav', result.stderr)
         self.assertFalse((self.mod/'manifest.tsv').exists())
@@ -65,17 +65,35 @@ class ModManifest(unittest.TestCase):
     def test_new_file_is_added(self):   # issue #48
         self.put('Sound/B.bwav', b'dubbed')
         self.put('UI/Tex/New/Gold.bntx.zs', b'new texture')
-        result = run(self.mod, '--romfs', self.romfs)
+        result = run(self.mod, '--romfs', self.romfs, '--version', 'v0')
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = sorted(l for l in (self.mod/'manifest.tsv').read_text().splitlines() if not l.startswith('#'))
         self.assertEqual(lines[1], '\t'.join(['UI/Tex/New/Gold.bntx.zs', '11', hashlib.sha256(b'new texture').hexdigest(), '-']))
         self.assertIn('(1 replaced, 1 added)', result.stdout)
 
-    def test_app_path_takes_the_version_from_the_folder(self):
+    def test_v0_header_hash_ios_app_symlink_and_other_version(self):
+        self.put('Sound/B.bwav', b'dubbed')
+        result = run(self.mod, '--romfs', self.romfs, '--version', 'v0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = (self.mod/'manifest.tsv').read_text()
+        self.assertTrue(text.startswith('# game-version v0\n'))
+        line = next(l for l in text.splitlines() if l.startswith('Sound/'))
+        self.assertEqual(line.split('\t')[2], hashlib.sha256(b'dubbed').hexdigest())
+        self.assertEqual(line.split('\t')[3], hashlib.sha256(FILES['Sound/B.bwav']).hexdigest())
+        (self.mod/'manifest.tsv').unlink()
+        link = self.mod/'Sound/Escape.bwav'
+        link.symlink_to(self.romfs/'romfs.bin')
+        refused = run(self.mod, '--romfs', self.romfs, '--version', 'v0')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('refusing symlink: Sound/Escape.bwav', refused.stderr)
+        self.assertFalse((self.mod/'manifest.tsv').exists())
+        link.unlink()
+        other = run(self.mod, '--romfs', self.romfs, '--version', 'v143')
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn('base 1.0.0', other.stderr)
         app = self.root/'Tears of the Kingdom.app'
-        fake_romfs(app/'Contents/Resources/totk/extracted/v143/romfs')
-        self.put('Pack/A.pack.zs', b'modded a')
-        result = run(self.mod, '--app', app)
+        fake_romfs(app/'GameData/romfs')
+        result = run(self.mod, '--app', app, '--version', 'v0')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('1 files', result.stdout)
 

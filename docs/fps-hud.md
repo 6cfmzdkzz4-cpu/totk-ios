@@ -1,5 +1,25 @@
 # iOS frame-rate counter
 
+The counter is only a display. The frame cap is a separate Settings control.
+
+## Frame cap
+
+Settings can pace presents at 30 or 60. 30 is the default. The host holds the
+present period to that ceiling and the existing real-time frame step samples the
+same spacing, so a 30 cap advances game time by about 1/30 second per present.
+60 uses the existing present-interval patch, whose minimum interval is one 60 Hz
+tick. Slow scenes can still drop to a longer interval. Neither value is a
+measurement that the device sustains that rate.
+
+**90 and 120 are unavailable.** They are shown in the in-app list so the limit
+is visible, and they cannot be selected or saved. The game's present interval is
+a whole 60 Hz tick and the existing patch floors it at 1. Driving that tick from
+a 90 or 120 Hz clock would reinterpret the interval the game calculated.
+Frame-counted interface logic was measured to diverge when presents were not
+held to the 60 Hz model. The real-time step clamps a sample to at least 1/120
+second so a faster present cannot make the game run fast; that clamp is not a
+90 or 120 gameplay mode. This tree adds no instruction patch for those rates.
+
 The small top-left counter uses the shared `DmFPSOverlay` UIKit control. A tap
 hides its label; the same transparent corner remains available to reveal it.
 Visibility is stored locally as `DmFPSOverlayHidden`. VoiceOver supports the same

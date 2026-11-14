@@ -8,6 +8,8 @@
 #include "runtime.h"
 #include "totk_scene_geometry.h"
 #include "totk_live_display.h"
+#include "totk_stable_aspect.h"
+#include "totk_frame_cap.h"
 #include "totk_ui_lang.h"
 static CAMetalLayer *metalLayer;
 static UIView *bootOverlay;
@@ -99,6 +101,14 @@ void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf
 -(void)tick:(CADisplayLink *)l{(void)l;pthread_mutex_lock(&vsyncLock);for(unsigned i=0;i<vsyncCount;i++)hle_signal_system_event(vsyncEvents[i]);pthread_mutex_unlock(&vsyncLock);}
 @end
 static TOTKVsync *vsyncTarget;
+static void apply_display_link_cap(void) {
+    if(!displayLink)return;
+    int hz=totk_frame_cap_applied_now();
+    if(hz!=30 && hz!=60)hz=60;
+    displayLink.preferredFrameRateRange=CAFrameRateRangeMake(hz,hz,hz);
+    fprintf(stderr,"[totk] display link pacing %d Hz\n",hz);
+}
+void runtime_ios_apply_frame_cap(void) {apply_display_link_cap();}
 
 /* Baseline for the selected signed preparation, including explicit fallback. */
 int runtime_ios_live_display_profile(void) {
@@ -133,7 +143,7 @@ int runtime_ios_update_geometry(CAMetalLayer *layer,UIView *host){
  if(CGSizeEqualToSize(layer.drawableSize,pixels) && layer.contentsScale==scale)return sceneChanged;
  layer.contentsScale=scale;layer.drawableSize=pixels;
  mtl_present_geometry_changed(); /* atomic request; worker owns interpolation history */
- fprintf(stderr,"[totk-display] drawable %ux%u scale %.3f baseline %.6f live-narrow=%d\n",g.pixel_width,g.pixel_height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile());
+ fprintf(stderr,"[totk-display] drawable %ux%u scale %.3f baseline %.6f live-narrow=%d stable=%d\n",g.pixel_width,g.pixel_height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile(),totk_stable_aspect_on());
  return 1;
 }
 
@@ -156,7 +166,7 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(1);}];
  runtime_feedback_focus(UIApplication.sharedApplication.applicationState==UIApplicationStateActive);
  vsyncTarget=[TOTKVsync new];displayLink=[CADisplayLink displayLinkWithTarget:vsyncTarget selector:@selector(tick:)];
- displayLink.preferredFrameRateRange=CAFrameRateRangeMake(60,60,60);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+ apply_display_link_cap();[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 /* The app already runs the loader on a game thread with a large stack; the event loop belongs to UIKit. */
 void runtime_front_run(void(*callback)(void)){

@@ -26,6 +26,7 @@
 #include "movie_host.h"
 #include <arm_neon.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,7 @@ void *runtime_movie_override(const char *name) {
     return NULL;
 }
 void movie_host_tick(void) {}
+int movie_host_cutscene_active(void) { return 0; }
 #else
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
@@ -53,7 +55,7 @@ typedef struct { int index; unsigned flags; int64_t time; } Ready;
 typedef struct { int index, offset, size; int64_t time; unsigned flags; } Pending;
 typedef struct {
     void *guest;                         /* the movie::Decoder object */
-    int format, configured, started, w, h, eos_in, format_sent, last_error;
+    int format, configured, started, w, h, eos_in, format_sent, last_error, cutscene_counted;
     void **events;                       /* DecoderEvents: EventType* per EV_* */
     vpx_codec_ctx_t vpx; int vpx_live;
     uint8_t *in[IN_BUFS]; int in_free[IN_BUFS], nin_free;
@@ -75,6 +77,22 @@ void movie_host_set_clock(uint64_t (*clock)(void)) { g_clock = clock ? clock : n
 static int pace_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_MOVIE_PACE"); v = !(e && !strcmp(e, "0")); } return v; }
 static Movie *g_movies[MAX_MOVIES];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_cutscene_movies;
+
+static void cutscene_note(Movie *m, int on) {
+    int ratio16x9 = m->w > 0 && m->h > 0 && m->w * 9 == m->h * 16;
+    if (on && ratio16x9 && !m->cutscene_counted) {
+        m->cutscene_counted = 1;
+        atomic_fetch_add_explicit(&g_cutscene_movies, 1, memory_order_release);
+        fprintf(stderr, "[movie] 16:9 cutscene %dx%d: present fits the movie inside the stable picture\n", m->w, m->h);
+    } else if (!on && m->cutscene_counted) {
+        m->cutscene_counted = 0;
+        atomic_fetch_sub_explicit(&g_cutscene_movies, 1, memory_order_release);
+    }
+}
+int movie_host_cutscene_active(void) {
+    return atomic_load_explicit(&g_cutscene_movies, memory_order_acquire) > 0;
+}
 
 static const char *const NAMES[MOVIE_ENTRIES] = {
     "_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi", "_ZN5movie7DecoderD2Ev",
@@ -225,6 +243,7 @@ static void drain_pending(Movie *m, Signals *s) {
     while (m->npending && decode_one(m, s, &m->pending[0])) { memmove(m->pending, m->pending + 1, (size_t)--m->npending * sizeof m->pending[0]); }
 }
 static void release_codec(Movie *m) {
+    cutscene_note(m, 0);
     if (m->vpx_live) { vpx_codec_destroy(&m->vpx); m->vpx_live = 0; }
     for (int i = 0; i < IN_BUFS; i++) { free(m->in[i]); m->in[i] = NULL; }
     for (int i = 0; i < OUT_BUFS; i++) { free(m->out[i]); m->out[i] = NULL; }
@@ -316,7 +335,7 @@ static int h_start(void *obj) {
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     if (!m->configured) { pthread_mutex_unlock(&m->mu); return ST_NOT_CONFIGURED; }
-    m->started = 1; note(m, &s, EV_INPUT);
+    m->started = 1; cutscene_note(m, 1); note(m, &s, EV_INPUT);
     pthread_mutex_unlock(&m->mu); fire(&s);
     return ST_OK;
 }

@@ -18,11 +18,17 @@ sys.path.insert(0, str(REPO))
 import build_app as upstream
 
 APP_FILENAME = f"{upstream.APP_NAME}.app"
+EXPERIMENTAL_APP_FILENAME = "TOTK-FreeAutobuild.app"
 
 # This exact permission-metadata variant is unused by the native runtime. It
 # carries no valid Nintendo ACID signature. All executable and RomFS gates stay
 # unchanged, and the metadata is never embedded in the personal app.
 KNOWN_UNUSED_NPDM = "e78c40978c23b42866973e6fe506c2ad7716ec51c651f35bfeada3415bb3b634"
+# A cached incremental build measured about 0.4 GiB net. 12 GiB stays above the packaging floor.
+CACHED_MIN_FREE_GIB = 12
+UNCACHED_APP_MIN_FREE_GIB = 45
+UNCACHED_IPA_MIN_FREE_GIB = 65
+PACK_MIN_FREE_GIB = 8
 
 
 def accept_known_unused_metadata(tree: Path, game: Path) -> bool:
@@ -60,20 +66,94 @@ def parse_args(argv=None):
     parser.add_argument("--work", type=Path, default=REPO / "work", help="private build cache; never commit it")
     parser.add_argument("--out", type=Path, default=REPO / "dist" / APP_FILENAME, help="personal .app or .ipa output")
     parser.add_argument("--display", choices=("ipad", "duo", "iphone"), default="ipad",
-                        help="ipad/duo: live narrow camera/HUD (landscape 1:1 to 16:9); iphone: static 239:110")
+                        help="ipad/duo: stable 4:3 picture with constant bars when the scene is wider; iphone: static 239:110")
+    parser.add_argument("--app-icon", type=Path, default=None,
+                        help="optional local square JPEG or PNG for the app icon; it stays on this Mac and is not published")
     parser.add_argument("--bundle-id", required=True, help="your stable application identifier; keep it for future updates")
     parser.add_argument("--cloud-container", default="", help="optional CloudKit container owned by your Apple team")
     parser.add_argument("--team", help="optional Apple development team ID for signing")
     parser.add_argument("--device", help="paired device UDID, required with --team")
     parser.add_argument("--install", action="store_true", help="install only after successful requested signing")
     parser.add_argument("--prepare-only", action="store_true", help="verify/extract inputs and regenerate display/feedback assets, without compiling")
+    parser.add_argument("--experimental-free-autobuild", action="store_true",
+                        help="build the separate Free Autobuild trial; refuses com.willspain.totk")
     parser.add_argument("--build-number", type=int, default=27)
     parser.add_argument("--dotnet", default="dotnet", help=".NET 10 SDK executable used to build the source-only shader translator")
+    parser.add_argument("--min-free-gib", type=float, default=None,
+                        help="override the preflight free-space requirement; cached RomFS otherwise requires 12 GiB, an uncached .app 45, and an uncached .ipa 65. TOTK_MIN_FREE_GIB is the same override")
     return parser.parse_args(argv)
+
+
+def free_requirement_gib(cached: bool, ipa: bool, override: float | None) -> float:
+    """GiB that must be free before starting. Uncached defaults stay at the full-extract requirement."""
+    if override is not None:
+        return override
+    if cached:
+        return CACHED_MIN_FREE_GIB
+    return UNCACHED_IPA_MIN_FREE_GIB if ipa else UNCACHED_APP_MIN_FREE_GIB
+
+
+def resolve_min_free(args) -> float | None:
+    """CLI wins over TOTK_MIN_FREE_GIB. Either value must stay at or above the packaging floor."""
+    raw = args.min_free_gib
+    if raw is None:
+        env = os.environ.get("TOTK_MIN_FREE_GIB", "").strip()
+        if not env:
+            return None
+        try:
+            raw = float(env)
+        except ValueError:
+            raise upstream.BuildError("TOTK_MIN_FREE_GIB must be a number of GiB") from None
+    if raw < PACK_MIN_FREE_GIB:
+        raise upstream.BuildError(f"--min-free-gib and TOTK_MIN_FREE_GIB must be at least {PACK_MIN_FREE_GIB:g} GiB")
+    return raw
+
+
+def assert_free_space(path: Path, gib: float, when: str) -> None:
+    """Stop before using a volume that is already below the stated floor."""
+    target = path if path.exists() else path.parent
+    free = shutil.disk_usage(target).free
+    if free < gib * 2**30:
+        raise upstream.BuildError(f"{when}: {free / 2**30:.1f} GiB free at {target}, need at least {gib:g} GiB")
+
+
+def experimental_personal_app(work: Path, out: Path, experimental: bool) -> Path:
+    """The .app path passed to the packager. An IPA is packed from this file afterward."""
+    if out.suffix.lower() == ".app":
+        return out
+    filename = EXPERIMENTAL_APP_FILENAME if experimental else APP_FILENAME
+    return work / "personal" / filename
+
+
+def ios_package_arguments(tree: Path, personal_app: Path, logs: Path, bundle_id: str, display: str, build_number: int,
+                          cloud_container: str, experimental: bool, app_icon: Path | None = None) -> list[str]:
+    """Arguments after the packager script. The trial .app name keeps the contiguous FreeAutobuild token."""
+    args = ["--tree", str(tree), "--out", str(personal_app), "--version", "v0", "--logs", str(logs),
+            "--bundle-id", bundle_id, "--display", display, "--build-number", str(build_number),
+            "--cloud-container", cloud_container, "--app-only"]
+    if experimental:
+        args.append("--experimental-free-autobuild")
+    if app_icon:
+        args.extend(["--app-icon", str(app_icon)])
+    return args
+
+
+def validate_experimental_identity(args):
+    """Reject a trial that would reuse the production bundle, iCloud container, or app filename."""
+    if not args.experimental_free_autobuild:
+        return
+    if args.bundle_id != "com.willspain.totk.freeautobuild" or "FreeAutobuild" not in args.out.name or args.out.name == APP_FILENAME:
+        raise upstream.BuildError("experimental Free Autobuild requires --bundle-id com.willspain.totk.freeautobuild and an output name containing FreeAutobuild")
+    if args.cloud_container:
+        raise upstream.BuildError("experimental Free Autobuild must not use a CloudKit container")
+    personal = experimental_personal_app(args.work, args.out, True)
+    if "FreeAutobuild" not in personal.name or personal.name == APP_FILENAME:
+        raise upstream.BuildError("experimental Free Autobuild intermediate app name must contain FreeAutobuild")
 
 
 def validate_options(args):
     """Reject ambiguous identity, unsupported inputs, and unintended install modes."""
+    validate_experimental_identity(args)
     if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", args.bundle_id):
         raise upstream.BuildError("--bundle-id must be a reverse-domain application identifier")
     if args.cloud_container and not re.fullmatch(r"iCloud\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", args.cloud_container):
@@ -86,6 +166,13 @@ def validate_options(args):
         raise upstream.BuildError("--prepare-only cannot sign or install")
     if args.build_number < 1:
         raise upstream.BuildError("--build-number must be positive")
+    if args.app_icon:
+        args.app_icon = args.app_icon.expanduser().resolve()
+        if not args.app_icon.is_file():
+            raise upstream.BuildError("--app-icon must be a local image file")
+        banned = ("romfs", "exefs", "prod.keys", ".nsp", ".xci", ".nca", "shared-fonts", ".bfttf")
+        if any(part in args.app_icon.as_posix().lower() for part in banned):
+            raise upstream.BuildError("--app-icon must be your own image, not a game, key, font or firmware path")
     for name in ("game", "keys", "work", "out", "firmware", "shared_fonts"):
         if value := getattr(args, name):
             setattr(args, name, value.expanduser().resolve())
@@ -141,9 +228,10 @@ def main(argv=None):
     args.work.mkdir(parents=True, exist_ok=True)
     logs = args.work / "logs"
     cached = (args.work / "totk/extracted/v0/romfs/romfs.bin").is_file()
-    required = 25 if cached else (65 if args.out.suffix.lower() == ".ipa" else 45)
-    if shutil.disk_usage(args.work).free < required * 2**30:
-        raise upstream.BuildError(f"allow at least {required} GiB free on the work volume")
+    ipa = args.out.suffix.lower() == ".ipa"
+    required = free_requirement_gib(cached, ipa, resolve_min_free(args))
+    kind = "cached RomFS" if cached else "uncached"
+    assert_free_space(args.work, required, f"allow at least {required:g} GiB free on the work volume for a {kind} build")
     env = dict(os.environ, PATH=os.pathsep.join(upstream.TOOL_PATHS + [os.environ.get("PATH", "")]))
     tree = upstream.prepare_work(args.work, py, logs)
     try:
@@ -180,6 +268,8 @@ def main(argv=None):
         "rewritten_sha256": {name: upstream.sha256(tree / "rewritten/v0" / name) for name in upstream.EXPECTED["rewritten_sha256"]},
         "generated_feedback_sha256": {p.name: upstream.sha256(p) for p in sorted((tree / "build").glob("gameplay_*.h"))},
         "live_narrow_display": narrow,
+        "stable_aspect": "4:3" if narrow else None,
+        "app_icon_sha256": upstream.sha256(args.app_icon) if args.app_icon else None,
         "live_layout_header_sha256": upstream.sha256(tree / "build/totk_live_layouts.h") if narrow else None,
         "prepared": True, "compiled": False, "signed": False, "installed": False,
     }
@@ -191,26 +281,34 @@ def main(argv=None):
     ensure_translator(tree, args, logs, env)
     upstream.step_shaders(tree, logs, version="v0")
     upstream.step_binary(tree, args.game, args.keys, env, logs, version="v0")
-    personal_app = args.out if args.out.suffix.lower() == ".app" else args.work / "personal" / APP_FILENAME
-    run([tree / ".venv/bin/python", "ios/tools/build_ipa.py", "--tree", tree, "--out", personal_app,
-         "--version", "v0", "--logs", logs, "--bundle-id", args.bundle_id, "--display", args.display,
-         "--build-number", str(args.build_number), "--cloud-container", args.cloud_container, "--app-only"], "build-ios.log")
+    personal_app = experimental_personal_app(args.work, args.out, args.experimental_free_autobuild)
+    assert_free_space(args.work, PACK_MIN_FREE_GIB, "packaging stopped")
+    assert_free_space(args.out.parent, PACK_MIN_FREE_GIB, "packaging stopped")
+    ios_cmd = [str(tree / ".venv/bin/python"), "ios/tools/build_ipa.py",
+               *ios_package_arguments(tree, personal_app, logs, args.bundle_id, args.display, args.build_number,
+                                      args.cloud_container, args.experimental_free_autobuild, args.app_icon)]
+    run(ios_cmd, "build-ios.log")
     receipt["compiled"] = True
     receipt["ios_dependencies"] = json.loads((tree / "build/ios-deps/manifest.json").read_text())
+    assert_free_space(args.work, PACK_MIN_FREE_GIB, "packaging stopped")
+    assert_free_space(args.out.parent, PACK_MIN_FREE_GIB, "packaging stopped")
     if args.team:
         from ios_sign import sign_app
         sign_app(personal_app, args.team, args.device, args.cloud_container, args.work / "signing")
         receipt["signed"] = True
     if args.out.suffix.lower() == ".ipa":
+        assert_free_space(args.work, PACK_MIN_FREE_GIB, "packaging stopped")
+        assert_free_space(args.out.parent, PACK_MIN_FREE_GIB, "packaging stopped")
         payload = args.work / "ipa/Payload"
         upstream.say("Packing the personal IPA; this contains your game and must stay private")
         if payload.parent.exists():
             shutil.rmtree(payload.parent)
         payload.mkdir(parents=True)
-        copied = subprocess.run(["cp", "-cR", str(personal_app), str(payload / APP_FILENAME)], capture_output=True)
+        payload_name = personal_app.name
+        copied = subprocess.run(["cp", "-cR", str(personal_app), str(payload / payload_name)], capture_output=True)
         if copied.returncode:
-            shutil.rmtree(payload / APP_FILENAME, ignore_errors=True)
-            shutil.copytree(personal_app, payload / APP_FILENAME)
+            shutil.rmtree(payload / payload_name, ignore_errors=True)
+            shutil.copytree(personal_app, payload / payload_name)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.unlink(missing_ok=True)
         upstream.run(["zip", "-qry", "-0", args.out, "Payload"], logs / "pack-ipa.log", cwd=payload.parent)

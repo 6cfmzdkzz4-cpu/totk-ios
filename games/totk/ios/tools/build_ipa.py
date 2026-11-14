@@ -59,11 +59,25 @@ def narrow_profile(version, display):
     return version=='v0' and display in ('ipad','duo')
 
 
-def display_export_env(env, tree, modules, version, display):
+def experimental_free_autobuild(bundle_id, app_name, cloud_container, version):
+    """Keep the trial off the installed production identity and off iCloud saves."""
+    if bundle_id == 'com.willspain.totk':
+        raise RuntimeError('experimental Free Autobuild must not replace com.willspain.totk')
+    if bundle_id != 'com.willspain.totk.freeautobuild':
+        raise RuntimeError('experimental Free Autobuild requires --bundle-id com.willspain.totk.freeautobuild')
+    if version != 'v0':
+        raise RuntimeError('experimental Free Autobuild is base 1.0.0 only')
+    if cloud_container:
+        raise RuntimeError('experimental Free Autobuild must not use a CloudKit container')
+    return 'TOTK Free Autobuild' if app_name == 'Tears of the Kingdom' else app_name
+
+
+def display_export_env(env, tree, modules, version, display, experimental=False):
     """Export code only, with no inherited relay/audit or mismatched aspect."""
     result=dict(env,TOTK_EXPORT_IOS=str(modules))
     for key in ('TOTK_ASPECT','TOTK_IPAD_ASPECT_PATCH','TOTK_IPHONE_ASPECT_PATCH','TOTK_PCHTXT',
-                'TOTK_ASPECT_UI_PATCHED','TOTK_LIVE_DISPLAY','TOTK_LIVE_DISPLAY_AUDIT','DM_DUO_RELAY'):
+                'TOTK_ASPECT_UI_PATCHED','TOTK_LIVE_DISPLAY','TOTK_LIVE_DISPLAY_AUDIT','DM_DUO_RELAY',
+                'TOTK_FREE_AUTOBUILD_EXPORT'):
         result.pop(key,None)
     if narrow_profile(version,display):
         result.update(TOTK_OUTPUT_RES='2752x2064',TOTK_RENDER_RES='2752x2064',TOTK_LIVE_DISPLAY='1',
@@ -71,6 +85,8 @@ def display_export_env(env, tree, modules, version, display):
     elif version=='v0':
         result.update(TOTK_OUTPUT_RES='1920x1080',TOTK_RENDER_RES='1920x1080',TOTK_ASPECT='239:110',
                       TOTK_IPHONE_ASPECT_PATCH='1',TOTK_PCHTXT=str(tree/'build/iphone239.pchtxt'))
+    if experimental:
+        result['TOTK_FREE_AUTOBUILD_EXPORT'] = '1'
     return result
 
 
@@ -94,11 +110,25 @@ def main():
     p.add_argument('--cloud-container', default='', help='optional private CloudKit container from your Apple team')
     p.add_argument('--build-number', type=int, default=27)
     p.add_argument('--app-only',action='store_true',help='prepare a device app bundle for direct signing and installation')
-    p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: live narrow display; iphone: static wide display')
-    a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
+    p.add_argument('--display',choices=['ipad','duo','iphone'],default='ipad',help='ipad/duo: stable 4:3 narrow picture; iphone: static wide display')
+    p.add_argument('--experimental-free-autobuild',action='store_true',help='separate base-1.0.0 trial app; does not change com.willspain.totk')
+    p.add_argument('--preflight',action='store_true',help='check the trial output name and identity, then exit before compiling')
+    p.add_argument('--app-icon',type=Path,help='local square JPEG or PNG scaled into the iOS icon set; the source image is not copied into git')
+    a=p.parse_args(); out=Path(a.out)
     if a.build_number < 1: raise RuntimeError('build number must be positive')
-    narrow=narrow_profile(a.version,a.display)
     if out.suffix.lower()!=('.app' if a.app_only else '.ipa'): raise RuntimeError('iOS output has the wrong extension')
+    if a.experimental_free_autobuild:
+        if 'FreeAutobuild' not in out.name:
+            raise RuntimeError('experimental output file name must contain FreeAutobuild')
+        a.app_name=experimental_free_autobuild(a.bundle_id,a.app_name,a.cloud_container,a.version)
+        if a.preflight:
+            print(f'preflight ok: display {a.app_name}; package {out.name}')
+            return
+    elif a.preflight:
+        print(f'preflight ok: package {out.name}')
+        return
+    tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=out.resolve()
+    narrow=narrow_profile(a.version,a.display)
     env=dict(os.environ,DEVELOPER_DIR=developer_dir())
     sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],env=env,text=True).strip()
     subprocess.run(['xcodebuild','-version'],env=env,check=True,stdout=subprocess.DEVNULL)
@@ -121,7 +151,7 @@ def main():
     host=tree/('build/totk-native' if a.version=='v0' else f'build/totk-native-{a.version}')
     rewritten=tree/f'rewritten/{a.version}'; modules=gen/'modules';modules.mkdir(exist_ok=True)
     # Native iPad output must be patched into signed code on the Mac, never into executable pages on the device.
-    e=display_export_env(env,tree,modules,a.version,a.display)
+    e=display_export_env(env,tree,modules,a.version,a.display,a.experimental_free_autobuild)
     run([host,rewritten,'export-ios'],tree,logs/'export-ios.log',e)
     flags=subprocess.check_output([sys.executable,ios/'tools/gen_embed.py',rewritten,gen/'embed.S','--text-dir',modules,'main','subsdk0','sdk'],text=True,env=env).strip()
     # The app's sources use version-specific patch and generated runtime tables.
@@ -150,6 +180,14 @@ def main():
     if a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')
     if a.version!='v0': project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
+    if a.app_icon:
+        icon=a.app_icon.expanduser().resolve()
+        if not icon.is_file(): raise RuntimeError('app icon must be a local image file')
+        run([sys.executable,ios/'tools/prepare_app_icon.py','--image',icon,'--output',gen/'Assets.xcassets'],tree,logs/'app-icon.log',env)
+        project=project.replace('      - path: Gen/Settings.bundle\n        type: folder\n        buildPhase: resources\n',
+            '      - path: Gen/Settings.bundle\n        type: folder\n        buildPhase: resources\n'
+            '      - path: Gen/Assets.xcassets\n        buildPhase: resources\n')
+        project=project.replace('CODE_SIGNING_ALLOWED: NO\n','CODE_SIGNING_ALLOWED: NO\n      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon\n')
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'

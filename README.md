@@ -8,11 +8,19 @@ The game's ARM64 code runs directly on the device. A small host implements the S
 
 - iPad: full-screen 4:3, starting at **1920 × 1440**.
 - iPhone: a **1920 × 1080** canvas fitted to the 239:110 display profile.
-- The iPad/Duo build follows landscape scene changes from 1:1 through 16:9 with paired camera, viewport and proportionate HUD updates. Unsupported layouts or scene shapes use a verified 4:3 fit. The wide-phone build keeps its separate 239:110 preparation. See [live geometry and evidence limits](docs/live-display.md).
+- iPad and Duo keep one verified 4:3 camera, viewport and HUD picture. A wider scene, including iPhone Duo landscape, keeps constant black side bars. A 16:9 pre-rendered cutscene is fitted inside that same picture. The wide-phone build keeps its separate 239:110 preparation. See [live geometry and evidence limits](docs/live-display.md).
 - Touch controls and physical gamepads. DualSense adds separate handle haptics, motion aiming, light shield resistance and a bow curve that increases through the trigger pull.
 - Contextual hits, landings, conversations, weapon charge, swimming, climbing and skydive textures. Exact audio-derived identities and envelopes are generated locally from the game.
 - Optional CloudKit save handoff between your devices. Routine sync runs in the background after committed saves. Actual conflicting saves require a choice so progress is preserved.
-- A top-left FPS counter: tap to hide it, then tap the same corner to show it again.
+- A top-left FPS counter: tap to hide it, then tap the same corner to show it again. The counter is separate from the frame cap in Settings.
+
+## Limits
+
+**Frame cap.** Settings can pace the game at **30** or **60**. 30 is the default and holds presents to 30 Hz; the existing real-time frame step follows that spacing. 60 uses the existing present-interval patch and is a ceiling, not evidence that a scene holds 60. **90 and 120 are unavailable** and cannot be selected. The game's present interval is a whole number of 60 Hz ticks and is floored at 1. Interface logic that counts frames was measured to diverge when presents leave that model. The real-time step's 1/120 second floor only keeps the game from running fast. It is not a 90 or 120 mode, and this change adds no gameplay patch for those rates.
+
+**Display.** The stable 4:3 picture and the 16:9 cutscene fit are source-tested. This change has not been run on an iPhone Duo, or on any device.
+
+**App icon.** `--app-icon` scales a local square JPEG or PNG into the iOS icon sizes. The image stays on your Mac. A 553 pixel source is upscaled for the 1024 pixel marketing icon. The generated art is not checked here.
 
 The source derives from [MacNativeGames](https://github.com/ly05010419/MacNativeGames), pinned at `15b1afd6255ec777ebceee0c62d33ab90861b07e`. The customized base-1.0.0 iPad build was played with a DualSense and accepted by its tester. The iPhone display and two-way save handoff were also tested in earlier local builds. That is scoped device evidence, not whole-game or sustained frame-rate certification. See [validation](docs/validation.md) and [the accepted build-23 release scope](docs/release-readiness23.md).
 
@@ -87,8 +95,26 @@ Related: [Super Mario Odyssey for iPad and iPhone](https://github.com/NicholasDo
      --bundle-id com.yourname.totk --display ipad --out "dist/Tears of the Kingdom.ipa"
    ```
 
-   Use `--display duo` (equivalent to `ipad`) for the live narrow/foldable profile, or `--display iphone` for a conventional wide iPhone. Both variants keep the same save identity; install only the matching variant. If you have already extracted the six BFTTF fonts, replace `--firmware` with `--shared-fonts "/path/to/shared-fonts"`. XCI dumps with the expected system partition can provide their own fonts. The command's `--help` lists the other options.
+   Use `--display duo` (equivalent to `ipad`) for the stable 4:3 narrow profile, or `--display iphone` for a conventional wide iPhone. Both variants keep the same save identity; install only the matching variant. Add `--app-icon "/path/to/your-square-image.jpg"` to use your own image as the icon. Keep the bundle id of an existing install so its saves stay available. If you have already extracted the six BFTTF fonts, replace `--firmware` with `--shared-fonts "/path/to/shared-fonts"`. XCI dumps with the expected system partition can provide their own fonts. The command's `--help` lists the other options.
 
 4. **Sign and install.** Sign `dist/Tears of the Kingdom.ipa` with your Apple account using a tool that preserves its increased-memory entitlement, such as [Sideloadly](https://sideloadly.io/). For direct Xcode-managed signing, connect and unlock the device, enable Developer Mode and trust the Mac, then add `--team YOURTEAMID --device YOUR_DEVICE_UDID --install` to step 3 and use `--out "dist/Tears of the Kingdom.app"`. `xcrun devicectl list devices` lists paired devices. The helper checks the profile before signing; it stops if a required capability is unavailable. For iCloud, first configure your container as described in [the signing guide](docs/signing.md), then also add `--cloud-container iCloud.com.yourname.totk` and use the direct signing route.
 
 5. **Open Tears of the Kingdom.** Allow the first shader import to finish, then play. Pair your controller in the device's Bluetooth settings. Tap the on-screen gear for **Gyro**, **Device haptics** and **Also with controller**, then tap **Done** to apply changes. Existing resolution and controller tuning are retained during updates. Keep your chosen bundle ID for future builds and back up `save/` before removing the app.
+
+## Optional base-1.0.0 RomFS mods
+
+This loads replacement files for the installed base game. It does not load ExeFS patches, pchtxt files, cheat codes, or emulator mods. The switch is off until you turn it on. The original game files in the app stay in place.
+
+1. On the Mac that built the app, put the mod's files under a folder using their RomFS paths, such as `UI/Pack/Example.bntx`.
+2. Write the manifest from that same base 1.0.0 RomFS. A mod built for another version fails the hash check and the game does not start:
+
+   ```sh
+   python3.14 games/totk/scripts/make_mod_manifest.py "/path/to/mod-folder" \
+     --romfs "/path/to/work/totk/extracted/v0/romfs" --version v0
+   ```
+
+   That generator is `games/totk/scripts/make_mod_manifest.py` in this repository. `git ls-files games/totk/scripts/make_mod_manifest.py` prints that path. `--version` must be `v0`. A built iOS app can be used instead of the work tree: `--app "dist/Tears of the Kingdom.app" --version v0` reads `GameData/romfs`.
+
+3. Copy that folder's contents into the app's `mods` folder with Finder or the Files app. `mods` is next to `save` in the app's documents. Leave `save/` and `shader-cache/` alone.
+4. Turn on **Use mods folder** in the in-app settings or in the system Settings app for this app, then launch again. The log line is `RomFS mods on` or `RomFS mods off`.
+5. Turn **Use mods folder** off and launch again to return to the original files. You do not need to delete the game data to do that.

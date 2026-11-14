@@ -4,6 +4,9 @@
 #import <Foundation/Foundation.h>
 #include "motion_source.h"
 #include "device_haptics.h"
+#include "totk_frame_cap.h"
+
+#define TOTK_FRAME_CAP_KEY @"TOTKFrameCap"
 
 #define TOTK_SIMPLE_GYRO_KEY @"TOTKGyroEnabled"
 #define TOTK_SIMPLE_HAPTICS_KEY @"TOTKDeviceHapticsEnabled"
@@ -31,6 +34,18 @@ static inline void totk_simple_settings_initialize(NSUserDefaults *p) {
 }
 static inline TOTKMotionMode totk_simple_motion_preference(NSUserDefaults *p) {
     return totk_simple_gyro_enabled(p)?TOTK_MOTION_AUTO:TOTK_MOTION_OFF;
+}
+static inline int totk_simple_frame_cap_requested(NSUserDefaults *p) {
+    id value=[p objectForKey:TOTK_FRAME_CAP_KEY];
+    if(!value)return TOTK_FRAME_CAP_DEFAULT;
+    int raw=(int)[value integerValue];
+    /* 90 and 120 are not stored as a slower cap. An old value falls back to 30. */
+    if(totk_frame_cap_unavailable(raw))return TOTK_FRAME_CAP_DEFAULT;
+    int hz=totk_frame_cap_normalize(raw);
+    return hz?hz:TOTK_FRAME_CAP_DEFAULT;
+}
+static inline int totk_simple_frame_cap_applied(NSUserDefaults *p) {
+    return totk_frame_cap_applied(totk_simple_frame_cap_requested(p));
 }
 static inline int totk_simple_device_haptic_mode(NSUserDefaults *p) {
     return !totk_simple_haptics_enabled(p)?TOTK_DEVICE_HAPTICS_OFF:

@@ -11,6 +11,9 @@
 #include "runtime.h"
 #include "dm_display_geometry.h"
 #include "totk_scene_geometry.h"
+#include "totk_stable_aspect.h"
+#include "totk_frame_cap.h"
+#include "romfs_mods.h"
 #include "feedback_preferences_ios.h"
 #include "simple_settings_ios.h"
 #import "touch_pad.h"
@@ -24,6 +27,7 @@ void runtime_ios_attach_layer(CAMetalLayer *layer, UIView *host);
 int runtime_ios_update_geometry(CAMetalLayer *layer, UIView *host);
 double runtime_ios_picture_aspect(void);
 int runtime_ios_live_display_profile(void);
+void runtime_ios_apply_frame_cap(void);
 static char *host_argv[3];
 static void *run_host(void *unused) { (void)unused; return (void *)(intptr_t)totk_host_main(3, host_argv); }
 /* The desktop keyboard-overlay shortcut has no counterpart on iOS. */
@@ -46,8 +50,8 @@ void runtime_shortcut_help_toggle(void) {}
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.blackColor;
     self.gameView = [[TOTKMetalView alloc] initWithFrame:self.view.bounds];
-    // Narrow live scenes own the full view; the renderer fits a source-bound
-    // baseline only when a layout/profile is explicitly unqualified.
+    // The narrow profile keeps one fitted picture. Layout updates its frame;
+    // autoresizing must not stretch it back over the side bars.
     self.gameView.autoresizingMask = UIViewAutoresizingNone;
     [self.view addSubview:self.gameView];
     [self updateDisplayGeometry];
@@ -62,7 +66,10 @@ void runtime_shortcut_help_toggle(void) {}
 - (void)updateDisplayGeometry {
     CGFloat scale=self.view.window.screen.nativeScale;
     if(!(scale>0))scale=self.view.traitCollection.displayScale;
-    dm_display_geometry g=totk_scene_picture(self.view.bounds.size.width,self.view.bounds.size.height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile());
+    UIEdgeInsets insets=self.view.safeAreaInsets;
+    dm_display_geometry g=totk_stable_aspect_on()
+        ? totk_stable_scene_picture(self.view.bounds.size.width,self.view.bounds.size.height,scale,insets.left,insets.top,insets.right,insets.bottom)
+        : totk_scene_picture(self.view.bounds.size.width,self.view.bounds.size.height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile());
     if(g.valid){
         CGRect picture=CGRectMake(g.picture.x,g.picture.y,g.picture.width,g.picture.height);
         if(!CGRectEqualToRect(self.gameView.frame,picture)){
@@ -128,7 +135,11 @@ void runtime_shortcut_help_toggle(void) {}
     self.window.rootViewController = [TOTKGameController new];
     [self.window makeKeyAndVisible];
 }
-- (void)sceneDidBecomeActive:(UIScene *)scene {runtime_device_motion_orientation((int)((UIWindowScene *)scene).interfaceOrientation);runtime_ios_foreground(1);[[TOTKCloudSave shared] checkForChanges];}
+- (void)sceneDidBecomeActive:(UIScene *)scene {
+    int requested=totk_simple_frame_cap_requested(NSUserDefaults.standardUserDefaults);
+    totk_frame_cap_set(requested);runtime_ios_apply_frame_cap();
+    runtime_device_motion_orientation((int)((UIWindowScene *)scene).interfaceOrientation);runtime_ios_foreground(1);[[TOTKCloudSave shared] checkForChanges];
+}
 - (void)sceneDidEnterBackground:(UIScene *)scene {(void)scene;runtime_ios_foreground(0);[[TOTKCloudSave shared] flushForBackground];}
 @end
 
@@ -140,9 +151,23 @@ void runtime_shortcut_help_toggle(void) {}
     application.idleTimerDisabled = YES;
     // Controller preferences are local to this device; the game still owns the authored rumble and motion-aiming behavior.
     NSUserDefaults *preferences=NSUserDefaults.standardUserDefaults;
-    [preferences registerDefaults:@{@"TOTKControllerHaptics":@YES,@"TOTKAdaptiveTriggers":@YES,
-        @"TOTKGyroAiming":@YES,@"TOTKResolution":@"1080",@"TOTKFeedbackStrength":@0.9,@"TOTKTriggerStrength":@0.55}];
+    NSMutableDictionary *defaults=[@{@"TOTKControllerHaptics":@YES,@"TOTKAdaptiveTriggers":@YES,
+        @"TOTKGyroAiming":@YES,@"TOTKResolution":@"1080",@"TOTKFeedbackStrength":@0.9,@"TOTKTriggerStrength":@0.55,
+        TOTK_FRAME_CAP_KEY:@(TOTK_FRAME_CAP_DEFAULT),@"TOTKRomFSModsEnabled":@NO} mutableCopy];
+    BOOL experimentalFreeAutobuild=[[NSBundle.mainBundle bundleIdentifier] isEqualToString:@"com.willspain.totk.freeautobuild"];
+    if(experimentalFreeAutobuild)defaults[@"TOTKFreeAutobuild"]=@YES;
+    [preferences registerDefaults:defaults];
     totk_simple_settings_initialize(preferences);
+    int storedCap=(int)[preferences integerForKey:TOTK_FRAME_CAP_KEY];
+    if(totk_frame_cap_unavailable(storedCap)){
+        fprintf(stderr,"[totk] stored frame cap %d is unavailable; using %d\n",storedCap,TOTK_FRAME_CAP_DEFAULT);
+        [preferences setInteger:TOTK_FRAME_CAP_DEFAULT forKey:TOTK_FRAME_CAP_KEY];
+    }
+    int requestedCap=totk_simple_frame_cap_requested(preferences);
+    totk_frame_cap_set(requestedCap);
+    char capText[8];snprintf(capText,sizeof capText,"%d",requestedCap);
+    setenv("TOTK_FPS_CAP",capText,1);
+    setenv("TOTK_UNCAPPED","0",1);
     BOOL haptics=[preferences boolForKey:@"TOTKControllerHaptics"];
     BOOL triggers=[preferences boolForKey:@"TOTKAdaptiveTriggers"];
     totk_ios_feedback_environment(haptics,triggers,[preferences doubleForKey:@"TOTKFeedbackStrength"],
@@ -152,7 +177,15 @@ void runtime_shortcut_help_toggle(void) {}
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
     NSString *res = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"GameData"];
-    for (NSString *name in @[@"save", @"temp", @"shader-cache", @"game-slot"]) [fm createDirectoryAtPath:[docs stringByAppendingPathComponent:name] withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *name in @[@"save", @"temp", @"shader-cache", @"game-slot", @"mods"]) [fm createDirectoryAtPath:[docs stringByAppendingPathComponent:name] withIntermediateDirectories:YES attributes:nil error:nil];
+    unsetenv("TOTK_ROMFS_MODS");
+    NSString *mods=[docs stringByAppendingPathComponent:@"mods"];
+    char modsReason[160];
+    int modsState=romfs_mods_inspect(mods.fileSystemRepresentation,[preferences boolForKey:@"TOTKRomFSModsEnabled"],modsReason,sizeof modsReason);
+    if(modsState==ROMFS_MODS_READY){
+        setenv("TOTK_ROMFS_MODS",mods.fileSystemRepresentation,1);
+        fprintf(stderr,"[totk] RomFS mods on: %s (%s)\n",mods.fileSystemRepresentation,modsReason);
+    }else fprintf(stderr,"[totk] RomFS mods off (%s)\n",modsReason[0]?modsReason:"not enabled");
     NSString *log = [docs stringByAppendingPathComponent:@"log.txt"];
     if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0);
     // Display profiles pair their signed camera/UI patches with device-local resolution preferences.
@@ -179,6 +212,7 @@ void runtime_shortcut_help_toggle(void) {}
         if(ipad){setenv("TOTK_ASPECT","4:3",1);setenv("TOTK_IPAD_ASPECT_PATCH","1",1);
             if([[NSBundle.mainBundle objectForInfoDictionaryKey:@"TOTKLiveDisplayNarrow"] boolValue]) {
                 setenv("TOTK_LIVE_DISPLAY","1",1);setenv("TOTK_ASPECT_UI_PATCHED","1",1);
+                setenv("TOTK_STABLE_ASPECT","1",1);
             }
         }
         else if(iphoneNative){setenv("TOTK_ASPECT","239:110",1);setenv("TOTK_IPHONE_ASPECT_PATCH","1",1);setenv("TOTK_ASPECT_UI_PATCHED","1",1);}
@@ -199,11 +233,19 @@ void runtime_shortcut_help_toggle(void) {}
     NSString *font = [res stringByAppendingPathComponent:@"font"]; setenv("TOTK_FONT_DIR",font.fileSystemRepresentation,1);
     // Same player environment as the Mac launcher (app/launcher.m); the bundle is read-only, so state goes to Documents.
     setenv("TOTK_PROFILE_DIR",[docs stringByAppendingPathComponent:@"save"].fileSystemRepresentation,1);
+    /* Same command file as the Mac launcher. An empty file does nothing; appending "flag mask_draw 1" records one scene frame. */
+    NSString *commands = [docs stringByAppendingPathComponent:@"input.txt"];
+    if (![fm fileExistsAtPath:commands]) [fm createFileAtPath:commands contents:[NSData data] attributes:nil];
+    setenv("TOTK_INPUT_FILE", commands.fileSystemRepresentation, 0);
+    runtime_input_file_start();   /* constructors already ran, before this variable existed */
     setenv("TOTK_GAME_SLOT_DIR",[docs stringByAppendingPathComponent:@"game-slot"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PROOF_DIR",docs.fileSystemRepresentation,1);   // hash the 17 GB RomFS once, not on every launch
     for (NSString *name in @[@"TOTK_GPU_ALLOW_SUBMIT",@"TOTK_GPU_WIDEN",@"TOTK_GPU_BLOCKRT",@"TOTK_GPU_MIDCLEAR"]) setenv(name.UTF8String,"1",1);
     setenv("TOTK_SLOT_OWNER","user",0); setenv("TOTK_SLOT_PURPOSE","player",0);
     unsetenv("TOTK_AUTOLOAD");
+    if(experimentalFreeAutobuild)
+        setenv("TOTK_FREE_AUTOBUILD",[preferences boolForKey:@"TOTKFreeAutobuild"]?"1":"0",1);
+    else unsetenv("TOTK_FREE_AUTOBUILD");
     chdir(docs.fileSystemRepresentation);
     host_argv[0] = strdup("TOTK"); host_argv[1] = strdup(res.fileSystemRepresentation); host_argv[2] = strdup("boot");
     return YES;
