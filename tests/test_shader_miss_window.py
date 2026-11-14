@@ -5,15 +5,20 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 MTL = (ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m').read_text()
 HLE = (ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c').read_text()
+RT = (ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/totk_shader_rt.m').read_text()
 
 
 class ShaderMissWindow(unittest.TestCase):
     def test_skip_is_unchanged_and_named(self):
         self.assertIn('if (pr && pr->missing) { shader_miss_note(pr); g_draw_skip[15]++; return; }', MTL)
         self.assertIn('if (fit < 0) { shader_miss_note(pr); g_draw_skip[15]++; return; }', MTL)
-        self.assertIn('#define SMISS_SLOTS 8', MTL)
+        self.assertIn('#define SMISS_SLOTS 1024', MTL)
+        self.assertIn('fxmiss.txt', MTL)
+        self.assertIn('strnlen(utf, 64)', MTL)
         self.assertIn('visible=%llu gated=%llu target=%ux%u fmt=%#x', MTL)
         self.assertIn('s->draws - s->seen_draws', MTL)
+        self.assertIn('totk_rt_import_fill', MTL)
+        self.assertIn('adopted cached metal', RT)
         self.assertNotIn('code_hex', MTL[MTL.find('shader_miss_note'):MTL.find('static void draw_inner')])
         self.assertIn('mtl_shader_miss_window(w, sizeof w)', HLE)
         self.assertIn('g_draw_skip[i] - prev[i]', HLE)

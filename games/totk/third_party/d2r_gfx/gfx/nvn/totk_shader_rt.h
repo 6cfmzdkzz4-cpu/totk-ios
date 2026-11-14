@@ -12,3 +12,6 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
 /* Variants new to the translation cache this run, the variants in the cache (-1 until counted in the background) and
    the CLOCK_UPTIME_RAW time of the last new one (0: none yet). Any pointer may be NULL. */
 void totk_rt_counts(uint64_t *fresh, int64_t *total, uint64_t *last_new_ns);
+/* Merge a shader-fill pack that arrived while the game is running. Returns how many files were imported (0 if none).
+   Clears the in-memory variant index so the next lookup sees the new Metal. */
+uint64_t totk_rt_import_fill(void);

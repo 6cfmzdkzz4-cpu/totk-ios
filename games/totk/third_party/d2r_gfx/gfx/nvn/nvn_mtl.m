@@ -2369,7 +2369,11 @@ static _Atomic int g_f207fix;
 static _Atomic int g_f207_border, g_f207_zero, g_f207_cmp, g_f207_neutral = -1;
 static _Atomic int g_f207_depth;
 static _Atomic int g_f207_lod, g_f207_vflip, g_f207_fmt, g_f207_const, g_f207_view, g_f207_save;
-static _Atomic int g_f207_inv = 1;
+static _Atomic int g_f207_inv;
+/* Thousandths. near: d' = d + k*(1-d)^2 (0 off, 1000 full). Far pixels stay put; only the camera shell moves.
+   floor: d' = max(d', floor) (0 off). 1000 is the old constant far=1, which also rewrote the distance. */
+static _Atomic int g_f207_near = 1000;
+static _Atomic int g_f207_floor;
 static _Atomic int g_fxquad = 1, g_fxwatch;
 static char g_fxskip[4][17];
 static _Atomic int g_fxskip_on;
@@ -2572,7 +2576,17 @@ void dm_gfx_set_flag(const char *name, int v) {
         diag_note("[flag] f207view %d (0 gloom; 1 r0; 2 r1; 3 r2 depth; 4 r0 with V flipped)", v); return;
     }
     if (!strcmp(name, "f207save")) { atomic_store(&g_f207_save, v != 0); diag_note("[flag] f207save %d (write Documents/f207-r0.raw and f207-r1.raw once)", v != 0); return; }
-    if (!strcmp(name, "f207inv")) { atomic_store(&g_f207_inv, v != 0); diag_note("[flag] f207inv %d (1 feeds 1-depth into the gloom pass)", v != 0); return; }
+    if (!strcmp(name, "f207inv")) { atomic_store(&g_f207_inv, v != 0); diag_note("[flag] f207inv %d (0 baseline; 1 feeds 1-depth, which paints the distance too)", v != 0); return; }
+    if (!strcmp(name, "f207near")) {
+        if (v < 0 || v > 1000) { diag_note("[flag] f207near requires 0..1000"); return; }
+        atomic_store(&g_f207_near, v);
+        diag_note("[flag] f207near %d (0 baseline; 1000 lifts only near depth, far stays)", v); return;
+    }
+    if (!strcmp(name, "f207floor")) {
+        if (v < 0 || v > 1000) { diag_note("[flag] f207floor requires 0..1000"); return; }
+        atomic_store(&g_f207_floor, v);
+        diag_note("[flag] f207floor %d (0 off; thousandths hard floor under the gloom depth; 1000 is constant far)", v); return;
+    }
     if (!strcmp(name, "fxquad")) { atomic_store(&g_fxquad, v != 0); diag_note("[flag] fxquad %d (1 draws indexed quads, fans and line loops)", v != 0); return; }
     if (!strcmp(name, "fxwatch")) { atomic_store(&g_fxwatch, v < 0 ? 0 : v); diag_note("[flag] fxwatch %d frames of effect draws", v < 0 ? 0 : v); return; }
     if (!strncmp(name, "fxskip_", 7)) {
@@ -4797,7 +4811,7 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
     const uint8_t *ctl[6], *code[6]; NSString *key[6]; uint64_t sig[6]; NSMutableDictionary<NSNumber *, NvShader *> *alt[6];
     void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw; uint32_t udc_cmask;   // udc_*: udc_note_draw's summary of sh[] (valid while sh[] is the same)
-    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
+    int missing, miss_has[2]; uint64_t miss_sig[2], fill_epoch; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); fill_epoch: last shader-fill import this program retried; exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
 @implementation NvProg @end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
@@ -7140,7 +7154,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)
         && (atomic_load(&g_f207_border) || atomic_load(&g_f207_zero) || atomic_load(&g_f207_cmp) || atomic_load(&g_f207_neutral) >= 0 || atomic_load(&g_f207_depth)
-            || atomic_load(&g_f207_lod) || atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_inv))) reuse = 0;
+            || atomic_load(&g_f207_lod) || atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_inv)
+            || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor))) reuse = 0;
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
         if (epoch_mode) { atomic_fetch_add_explicit(&g_arg_epoch_hits, 1, memory_order_relaxed); if (g_args_dirty[nvn_stage]) atomic_fetch_add_explicit(&g_arg_epoch_extra, 1, memory_order_relaxed); }
@@ -7355,7 +7370,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     if (nvn_stage == 1 && !strncmp(sh->key, "f207b1d79f3cc194", 16)) {
         int border = atomic_load(&g_f207_border), zero = atomic_load(&g_f207_zero), cmp = atomic_load(&g_f207_cmp), neutral = atomic_load(&g_f207_neutral), depth = atomic_load(&g_f207_depth);
         int lod = atomic_load(&g_f207_lod), vflip = atomic_load(&g_f207_vflip), fmtp = atomic_load(&g_f207_fmt), cnst = atomic_load(&g_f207_const), inv = atomic_load(&g_f207_inv);
-        if (border || zero || cmp || neutral >= 0 || depth || lod || vflip || fmtp || cnst || inv) for (int i = 0; i < sh->rf.nb; i++) {
+        int lift = atomic_load(&g_f207_near), depth_floor = atomic_load(&g_f207_floor);
+        if (border || zero || cmp || neutral >= 0 || depth || lod || vflip || fmtp || cnst || inv || lift || depth_floor) for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg, aid = b->aid;
             if (reg < 0 || reg >= 128) continue;
             int tid = (int)(S.tex[1][reg] & 0xfffff);
@@ -7364,7 +7380,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             unsigned fm = ok ? g_treg[tid].t.d.format : 0;
             if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && cnst && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_cdepth[cnst - 1]) {
                 slots[aid] = g_f207_cdepth[cnst - 1].gpuResourceID._impl;
-            } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && inv && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_inv_tex) {
+            } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && (inv || lift || depth_floor) && reg == 2 && fm >= 0x32 && fm <= 0x36 && g_f207_inv_tex) {
                 slots[aid] = g_f207_inv_tex.gpuResourceID._impl;
             } else if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && ok && (vflip || fmtp) && reg < 2 && g_f207_alt[reg] && g_f207_alt_ser[reg] == g_treg[tid].t.serial) {
                 slots[aid] = g_f207_alt[reg].gpuResourceID._impl;
@@ -9779,33 +9795,79 @@ static int mfxup_draw(NvProg *pr) {
     return 0;
 }
 #include "nvn_cube_group.h"
-/* Missing-shader draws stay skipped. This only names, per 300-frame report, which key was skipped and the color
-   target it would have written. Eight keys; further keys add to the overflow count. No shader bytes, no texture dump. */
-#define SMISS_SLOTS 8
-typedef struct { char key[17]; uint32_t w, h, fmt; uint64_t draws, gated, seen_draws, seen_gated; uint8_t stage, varied; } smiss_slot;
+/* Missing-shader draws stay skipped. The 300-frame log names a short window. Every key is kept here and rewritten
+   to fxmiss.txt (same directory as TOTK_INPUT_FILE) so the list is not cut off. No shader bytes, no texture dump. */
+#define SMISS_SLOTS 1024
+typedef struct { char key[65]; uint32_t w, h, fmt; uint64_t draws, gated, seen_draws, seen_gated; uint8_t stage, varied; } smiss_slot;
 static smiss_slot g_smiss[SMISS_SLOTS];
 static uint64_t g_smiss_over, g_smiss_over_seen;
 static pthread_mutex_t g_smiss_mu = PTHREAD_MUTEX_INITIALIZER;
-static void shader_miss_note(NvProg *pr) {
-    if (!pr) { pthread_mutex_lock(&g_smiss_mu); g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); return; }
-    int st = (pr->missing & 2) && pr->key[1] ? 1 : (pr->missing & 1) && pr->key[0] ? 0 : pr->miss_has[1] && pr->key[1] ? 1 : pr->miss_has[0] && pr->key[0] ? 0 : pr->key[1] ? 1 : pr->key[0] ? 0 : -1;
-    if (st < 0) { pthread_mutex_lock(&g_smiss_mu); g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); return; }
-    const char *utf = pr->key[st].UTF8String; char key[17]; memset(key, 0, sizeof key); if (utf) memcpy(key, utf, strnlen(utf, 16));
-    uint32_t w = 0, h = 0, fmt = 0;
-    if (R.has_rt && R.rt.color[0]) { w = R.rt.color[0]->d.width; h = R.rt.color[0]->d.height; fmt = R.rt.color[0]->d.format; }
-    int gated = S.render_disabled != 0;
+static int smiss_by_draws(const void *a, const void *b) {
+    const smiss_slot *x = a, *y = b;
+    if (x->draws < y->draws) return 1; if (x->draws > y->draws) return -1;
+    return strcmp(x->key, y->key);
+}
+static void shader_miss_flush(int force) {
+    static time_t last; time_t now = time(NULL);
+    if (!force && now == last) return;
+    const char *in = getenv("TOTK_INPUT_FILE"); const char *slash = in ? strrchr(in, '/') : NULL;
+    if (!slash) return;
+    smiss_slot *copy = malloc(sizeof(smiss_slot) * SMISS_SLOTS); if (!copy) return;
+    int n = 0; uint64_t over;
     pthread_mutex_lock(&g_smiss_mu);
+    for (int i = 0; i < SMISS_SLOTS; i++) if (g_smiss[i].key[0]) copy[n++] = g_smiss[i];
+    over = g_smiss_over;
+    pthread_mutex_unlock(&g_smiss_mu);
+    if (!n && !over && !force) { free(copy); return; }
+    last = now;
+    qsort(copy, (size_t)n, sizeof *copy, smiss_by_draws);
+    char path[1024]; snprintf(path, sizeof path, "%.*s/fxmiss.txt", (int)(slash - in), in);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# missing shaders. The draw is skipped before Metal compile: the variant is not in the device cache.\n");
+        fprintf(f, "# iOS cannot translate NVN shaders. shader-requests/*.json is the input for ios/tools/fill_shaders.py.\n");
+        fprintf(f, "# A pack pushed to shader-fill/ is compiled on the next frames, without restarting.\n");
+        fprintf(f, "count=%d overflow=%llu\n", n, (unsigned long long)over);
+        for (int i = 0; i < n; i++) {
+            smiss_slot *s = &copy[i];
+            fprintf(f, "%s %s draws=%llu gated=%llu target=%ux%u fmt=%#x%s\n",
+                s->stage ? "ps" : "vs", s->key, (unsigned long long)s->draws, (unsigned long long)s->gated,
+                s->w, s->h, s->fmt, s->varied ? " size-varied" : "");
+        }
+        fclose(f);
+    }
+    free(copy);
+}
+static void shader_miss_one(int st, NSString *keystr, int gated, uint32_t w, uint32_t h, uint32_t fmt) {
+    const char *utf = keystr.UTF8String; char key[65]; memset(key, 0, sizeof key);
+    if (utf) memcpy(key, utf, strnlen(utf, 64));
+    if (!key[0]) { g_smiss_over++; return; }
     int slot = -1, free_slot = -1;
     for (int i = 0; i < SMISS_SLOTS; i++) {
         if (!g_smiss[i].key[0]) { if (free_slot < 0) free_slot = i; continue; }
-        if (g_smiss[i].stage == (uint8_t)st && !memcmp(g_smiss[i].key, key, 16)) { slot = i; break; }
+        if (g_smiss[i].stage == (uint8_t)st && !strcmp(g_smiss[i].key, key)) { slot = i; break; }
     }
     if (slot < 0) {
-        if (free_slot < 0) { g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); return; }
-        slot = free_slot; memcpy(g_smiss[slot].key, key, 16); g_smiss[slot].stage = (uint8_t)st; g_smiss[slot].w = w; g_smiss[slot].h = h; g_smiss[slot].fmt = fmt;
+        if (free_slot < 0) { g_smiss_over++; return; }
+        slot = free_slot; memcpy(g_smiss[slot].key, key, sizeof key); g_smiss[slot].stage = (uint8_t)st;
+        g_smiss[slot].w = w; g_smiss[slot].h = h; g_smiss[slot].fmt = fmt;
     } else if (g_smiss[slot].w != w || g_smiss[slot].h != h || g_smiss[slot].fmt != fmt) g_smiss[slot].varied = 1;
     g_smiss[slot].draws++; if (gated) g_smiss[slot].gated++;
+}
+static void shader_miss_note(NvProg *pr) {
+    pthread_mutex_lock(&g_smiss_mu);
+    if (!pr) { g_smiss_over++; pthread_mutex_unlock(&g_smiss_mu); shader_miss_flush(0); return; }
+    uint32_t w = 0, h = 0, fmt = 0;
+    if (R.has_rt && R.rt.color[0]) { w = R.rt.color[0]->d.width; h = R.rt.color[0]->d.height; fmt = R.rt.color[0]->d.format; }
+    int gated = S.render_disabled != 0, n = 0;
+    for (int st = 0; st < 2; st++) {
+        int miss = (pr->missing & (1 << st)) || pr->miss_has[st];
+        if (!miss || !pr->key[st]) continue;
+        shader_miss_one(st, pr->key[st], gated, w, h, fmt); n++;
+    }
+    if (!n) g_smiss_over++;
     pthread_mutex_unlock(&g_smiss_mu);
+    shader_miss_flush(0);
 }
 void mtl_shader_miss_window(char *buf, size_t cap) {
     if (!buf || !cap) return; buf[0] = 0;
@@ -10013,9 +10075,9 @@ static void f207_const_depth(int which) {
     enc_r_end(enc_r_begin(rp));
     g_f207_cdepth[which - 1] = t;
 }
-static void f207_invert_depth(void) {
+static void f207_remap_depth(int invert) {
     id<MTLTexture> src = f207_bound(2);
-    if (g_rs_active) { static int once; if (!once++) diag_note("[f207inv] render stream is on"); return; }
+    if (g_rs_active) { static int once; if (!once++) diag_note("[f207near] render stream is on"); return; }
     if (!src || !src.width || !src.height) return;
     if (src.pixelFormat != MTLPixelFormatDepth32Float && src.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 && src.pixelFormat != MTLPixelFormatDepth16Unorm) return;
     if (g_enc) rp_end();
@@ -10026,34 +10088,47 @@ static void f207_invert_depth(void) {
         if (!t) return;
         res_add(t); g_f207_inv_tex = t;
     }
-    static id<MTLRenderPipelineState> ps; static id<MTL4ArgumentTable> at; static id<MTLDepthStencilState> dss;
+    static id<MTLRenderPipelineState> ps; static id<MTL4ArgumentTable> at; static id<MTLDepthStencilState> dss; static id<MTLBuffer> params;
     if (!ps) {
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:
             @"#include <metal_stdlib>\nusing namespace metal;\n"
-            "vertex float4 f207i_vs(uint id [[vertex_id]]) { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2.0 - 1.0, 0.0, 1.0); }\n"
+            "vertex float4 f207r_vs(uint id [[vertex_id]]) { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2.0 - 1.0, 0.0, 1.0); }\n"
             "struct O { float d [[depth(any)]]; };\n"
-            "fragment O f207i_fs(float4 p [[position]], depth2d<float> src [[texture(0)]]) {\n"
+            "struct U { int mode; float k; float floor; };\n"
+            "fragment O f207r_fs(float4 p [[position]], depth2d<float> src [[texture(0)]], constant U& u [[buffer(0)]]) {\n"
             "  uint2 xy = uint2(p.xy); if (xy.x >= src.get_width()) xy.x = src.get_width() - 1; if (xy.y >= src.get_height()) xy.y = src.get_height() - 1;\n"
-            "  O o; o.d = 1.0 - src.read(xy); return o; }\n" options:nil error:&e];
-        if (!lib) { diag_note("[f207inv] shader failed"); return; }
+            "  float d = src.read(xy); float gap = 1.0 - d;\n"
+            "  O o; o.d = u.mode == 1 ? gap : max(d + gap * gap * u.k, u.floor); return o; }\n" options:nil error:&e];
+        if (!lib) { diag_note("[f207near] shader failed"); return; }
         MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-        d.vertexFunction = [lib newFunctionWithName:@"f207i_vs"]; d.fragmentFunction = [lib newFunctionWithName:@"f207i_fs"];
+        d.vertexFunction = [lib newFunctionWithName:@"f207r_vs"]; d.fragmentFunction = [lib newFunctionWithName:@"f207r_fs"];
         d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
-        if (!ps) { diag_note("[f207inv] pipeline failed"); return; }
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1;
+        if (!ps) { diag_note("[f207near] pipeline failed"); return; }
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxBufferBindCount = 1;
         at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
         MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
         dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
         dss = [g_dev newDepthStencilStateWithDescriptor:dd];
+        params = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; res_add(params);
     }
+    if (!params) return;
+    int lift = atomic_load(&g_f207_near), depth_floor = atomic_load(&g_f207_floor);
+    static int logged_lift = -1, logged_floor = -1, logged_inv = -1;
+    if (lift != logged_lift || depth_floor != logged_floor || invert != logged_inv) {
+        logged_lift = lift; logged_floor = depth_floor; logged_inv = invert;
+        diag_note("[f207near] k=%d floor=%d inv=%d", lift, depth_floor, invert);
+    }
+    int *mode = params.contents; mode[0] = invert ? 1 : 0;
+    float *coeff = params.contents; coeff[1] = lift / 1000.0f; coeff[2] = depth_floor / 1000.0f;
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.depthAttachment.texture = g_f207_inv_tex; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = 1;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
     id<MTL4RenderCommandEncoder> en = enc_r_begin(rp);
     if (!en || !at) return;
     [at setTexture:src.gpuResourceID atIndex:0];
+    [at setAddress:params.gpuAddress atIndex:0];
     [en setArgumentTable:at atStages:MTLRenderStageFragment];
     [en setRenderPipelineState:ps]; [en setDepthStencilState:dss];
     [en setViewport:(MTLViewport){0, 0, (double)src.width, (double)src.height, 0, 1}];
@@ -10077,7 +10152,7 @@ static void f207_prepare_alts(void) {
         if (dst && dst != src) { g_f207_alt[reg] = dst; g_f207_alt_ser[reg] = ser; }
     }
     if (cnst) f207_const_depth(cnst);
-    else if (atomic_load(&g_f207_inv)) f207_invert_depth();
+    else if (atomic_load(&g_f207_inv) || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor)) f207_remap_depth(atomic_load(&g_f207_inv));
 }
 static int f207_debug_draw(int mode) {
     if (g_rs_active) { diag_note("[f207view] render stream is on"); return 0; }
@@ -10283,8 +10358,8 @@ static void fx_watch_draw(NvProg *pr, int prim, int count) {
     if (fr != frame) {
         if (frame && n) {
             atomic_fetch_sub(&g_fxwatch, 1);
-            char w[700], line[760]; mtl_shader_miss_window(w, sizeof w);
-            if (w[0]) { snprintf(line, sizeof line, "[fxmiss] %s", w); diag_append(line); }
+            shader_miss_flush(1);
+            diag_append("[fxmiss] full list in fxmiss.txt");
         }
         frame = fr; n = 0;
     }
@@ -10295,9 +10370,39 @@ static void fx_watch_draw(NvProg *pr, int prim, int count) {
         (unsigned long long)fr, prim, S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb,
         S.color.alpha_func, tw, th, count, pr->sh[1]->key);
 }
+static _Atomic uint64_t g_shader_epoch;
+static void shader_fill_poll(void) {
+    static time_t last; time_t now = time(NULL);
+    if (now == last) return; last = now;
+    uint64_t n = totk_rt_import_fill();
+    if (n) { atomic_fetch_add(&g_shader_epoch, 1); diag_note("[shader-fill] imported %llu files; missing shaders compile on the next draw", (unsigned long long)n); }
+}
+static int shader_epoch_bumped(NvProg *pr) {
+    uint64_t epoch = atomic_load(&g_shader_epoch);
+    if (!pr || pr->fill_epoch == epoch) return 0;
+    pr->fill_epoch = epoch; pr->miss_has[0] = pr->miss_has[1] = 0;
+    return 1;
+}
+static void shader_miss_retry(NvProg *pr) {
+    if (!shader_epoch_bumped(pr)) return;
+    for (int st = 0; st < 2; st++) {
+        if (!(pr->missing & (1 << st)) || !pr->key[st] || !pr->ctl[st] || !pr->code[st]) continue;
+        NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), rt_local(pr->ctl[st], st));
+        if (!variant) continue;
+        NvShader *sh = shader_get([variant stringByAppendingString:@"_b"], st);
+        if (!sh) continue;
+        pr->sh[st] = sh; pr->sig[st] = stage_sig(st);
+        if (!pr->alt[st]) pr->alt[st] = [NSMutableDictionary dictionary];
+        pr->alt[st][@(pr->sig[st])] = sh;
+        pr->missing &= ~(1 << st);
+        diag_note("[shader-fill] compiled %s %.16s", st ? "ps" : "vs", pr->key[st].UTF8String);
+    }
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
+    shader_fill_poll();
+    if (pr) shader_miss_retry(pr);
     if (pr && pr->missing) { shader_miss_note(pr); g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
     { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { shader_miss_note(pr); g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
@@ -10327,12 +10432,13 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         g_f207_dumped = 1;
         const tex_t *ct = R.rt.color[0];
         char body[3600]; size_t o = 0;
-        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d depth=%d lod=%d vflip=%d fmtp=%d const=%d view=%d scene=%ux%u@F%llu\n",
+        o += (size_t)snprintf(body + o, sizeof body - o, "[f207] F%llu tgt=%ux%u fmt=%#x viewfmt=%d clear=%d blend=%#x %u,%u,%u/%u,%u,%u mask=%#x sc=%d,%d,%d,%d flags border=%d zero=%d cmp=%d slot=%d depth=%d lod=%d vflip=%d fmtp=%d const=%d view=%d near=%d floor=%d inv=%d scene=%ux%u@F%llu\n",
             (unsigned long long)atomic_load(&g_cur_frame), ct->d.width, ct->d.height, ct->d.format, R.rt.has_cview[0] && R.rt.cview[0].set_format ? R.rt.cview[0].format : -1, R.clear_c[0],
             S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb, S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
             S.chmask.mask, R.has_sc ? R.sc.x : 0, R.has_sc ? R.sc.y : 0, R.has_sc ? R.sc.w : (int)ct->d.width, R.has_sc ? R.sc.h : (int)ct->d.height,
             atomic_load(&g_f207_border), atomic_load(&g_f207_zero), atomic_load(&g_f207_cmp), atomic_load(&g_f207_neutral), atomic_load(&g_f207_depth),
             atomic_load(&g_f207_lod), atomic_load(&g_f207_vflip), atomic_load(&g_f207_fmt), atomic_load(&g_f207_const), atomic_load(&g_f207_view),
+            atomic_load(&g_f207_near), atomic_load(&g_f207_floor), atomic_load(&g_f207_inv),
             g_scene_dw, g_scene_dh, (unsigned long long)g_scene_dframe);
         registry_lock();
         for (int r = 0; r < 8 && o + 400 < sizeof body; r++) {
@@ -10378,7 +10484,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         if (now != stamped) { stamped = now; diag_status("[f207fix] 960x720 RGBA8 draw not run"); }
         return;
     }
-    if (f207 && (atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_save) || atomic_load(&g_f207_view) || atomic_load(&g_f207_inv))) {
+    if (f207 && (atomic_load(&g_f207_vflip) || atomic_load(&g_f207_fmt) || atomic_load(&g_f207_const) || atomic_load(&g_f207_save) || atomic_load(&g_f207_view) || atomic_load(&g_f207_inv) || atomic_load(&g_f207_near) || atomic_load(&g_f207_floor))) {
         f207_prepare_alts();
         f207_save_maps();
         int view = atomic_load(&g_f207_view);
