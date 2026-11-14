@@ -2370,6 +2370,9 @@ static _Atomic int g_f207_border, g_f207_zero, g_f207_cmp, g_f207_neutral = -1;
 static _Atomic int g_f207_depth;
 static _Atomic int g_f207_lod, g_f207_vflip, g_f207_fmt, g_f207_const, g_f207_view, g_f207_save;
 static _Atomic int g_f207_inv = 1;
+static _Atomic int g_fxquad = 1, g_fxwatch;
+static char g_fxskip[4][17];
+static _Atomic int g_fxskip_on;
 static id<MTLTexture> g_f207_inv_tex;
 static id<MTLTexture> g_f207_alt[2];
 static uint64_t g_f207_alt_ser[2];
@@ -2570,6 +2573,21 @@ void dm_gfx_set_flag(const char *name, int v) {
     }
     if (!strcmp(name, "f207save")) { atomic_store(&g_f207_save, v != 0); diag_note("[flag] f207save %d (write Documents/f207-r0.raw and f207-r1.raw once)", v != 0); return; }
     if (!strcmp(name, "f207inv")) { atomic_store(&g_f207_inv, v != 0); diag_note("[flag] f207inv %d (1 feeds 1-depth into the gloom pass)", v != 0); return; }
+    if (!strcmp(name, "fxquad")) { atomic_store(&g_fxquad, v != 0); diag_note("[flag] fxquad %d (1 draws indexed quads, fans and line loops)", v != 0); return; }
+    if (!strcmp(name, "fxwatch")) { atomic_store(&g_fxwatch, v < 0 ? 0 : v); diag_note("[flag] fxwatch %d frames of effect draws", v < 0 ? 0 : v); return; }
+    if (!strncmp(name, "fxskip_", 7)) {
+        const char *p = name + 7; int n = (int)strlen(p);
+        if (!mask_skip_hex(p, n) || n != 16) { diag_note("[flag] fxskip needs 16 hex digits"); return; }
+        char key[17]; for (int i = 0; i < 16; i++) key[i] = mask_skip_lower(p[i]); key[16] = 0;
+        pthread_mutex_lock(&g_skip_mu);
+        int slot = -1; for (int i = 0; i < 4; i++) if (g_fxskip[i][0] && !strncmp(g_fxskip[i], key, 16)) slot = i;
+        if (v && slot < 0) { for (int i = 0; i < 4; i++) if (!g_fxskip[i][0]) { memcpy(g_fxskip[i], key, 17); slot = i; break; } }
+        if (!v && slot >= 0) g_fxskip[slot][0] = 0;
+        int on = 0; for (int i = 0; i < 4; i++) if (g_fxskip[i][0]) on = 1;
+        pthread_mutex_unlock(&g_skip_mu);
+        atomic_store(&g_fxskip_on, on);
+        diag_note("[flag] fxskip %s %s", key, v ? "on" : "off"); return;
+    }
     if (!strcmp(name, "skippass")) {
         if (v < -1 || v > 31) { MLOG("[flag] skippass requires -1..31"); return; }
         atomic_store(&g_skippass, v);
@@ -10157,6 +10175,126 @@ static void f207_save_maps(void) {
         }];
     }
 }
+static int fx_index_at(const uint8_t *b, int itype, int i) {
+    if (itype == 0) return b[i] == 0xff ? -1 : b[i];
+    if (itype == 1) { uint16_t v; memcpy(&v, b + (size_t)i * 2, 2); return v == 0xffff ? -1 : v; }
+    uint32_t v; memcpy(&v, b + (size_t)i * 4, 4); return v == 0xffffffffu ? -1 : (int)v;
+}
+static const uint8_t *fx_index_bytes(const p_draw_idx *di) {
+    int es = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
+    if (pend_hits(di->ibuf, (uint64_t)di->count * es)) return NULL;
+    void *mb; uint64_t mo, gpu;
+    if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) return NULL;
+    return (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo;
+}
+static void fx_note_expand(const char *kind, NvProg *pr, int count) {
+    static char seen[8][17]; static int n;
+    const char *key = pr && pr->sh[1] ? pr->sh[1]->key : "";
+    for (int i = 0; i < n; i++) if (!strncmp(seen[i], key, 16)) return;
+    if (n < 8) { snprintf(seen[n], 17, "%.16s", key); n++; }
+    diag_note("[fxprim] %s fs=%.16s indices=%d", kind, key[0] ? key : "-", count);
+}
+static int fx_expand(id<MTL4RenderCommandEncoder> en, int prim, const p_draw *dw, const p_draw_idx *di, NvProg *pr) {
+    if (!atomic_load(&g_fxquad)) return 0;
+    const uint8_t *src = di ? fx_index_bytes(di) : NULL;
+    if (di && !src) return 0;
+    int count = dw ? dw->count : di->count;
+    int inst = dw ? (dw->instances > 0 ? dw->instances : 1) : (di->instances ? di->instances : 1);
+    int base = dw ? dw->first : di->base_vertex;
+    int binst = dw ? dw->base_instance : di->base_instance;
+    if (prim == 7 && di) {
+        int nq = count / 4; if (nq <= 0) return 1;
+        id<MTLBuffer> out; size_t off = arena_alloc((size_t)nq * 6 * 4, &out);
+        uint32_t *dst = (uint32_t *)((uint8_t *)out.contents + off); int w = 0;
+        for (int q = 0; q < nq; q++) {
+            uint32_t ix[4]; int bad = 0;
+            for (int k = 0; k < 4; k++) { int v = fx_index_at(src, di->itype, q * 4 + k); if (v < 0) { bad = 1; break; } ix[k] = (uint32_t)v; }
+            if (bad) continue;
+            dst[w++] = ix[0]; dst[w++] = ix[1]; dst[w++] = ix[2]; dst[w++] = ix[0]; dst[w++] = ix[2]; dst[w++] = ix[3];
+        }
+        if (w) enc_r_draw_indexed(en, MTLPrimitiveTypeTriangle, w, MTLIndexTypeUInt32, out.gpuAddress + off, (size_t)w * 4, inst, base, binst);
+        fx_note_expand("indexed-quads", pr, count); return 1;
+    }
+    if (prim == 6) {
+        if (count < 3) return 1;
+        int ntri = count - 2;
+        id<MTLBuffer> out; size_t off = arena_alloc((size_t)ntri * 3 * 4, &out);
+        uint32_t *dst = (uint32_t *)((uint8_t *)out.contents + off); int w = 0;
+        for (int i = 1; i < count - 1; i++) {
+            int a = di ? fx_index_at(src, di->itype, 0) : 0;
+            int b = di ? fx_index_at(src, di->itype, i) : i;
+            int c = di ? fx_index_at(src, di->itype, i + 1) : i + 1;
+            if (a < 0 || b < 0 || c < 0) continue;
+            dst[w++] = (uint32_t)a; dst[w++] = (uint32_t)b; dst[w++] = (uint32_t)c;
+        }
+        if (w) enc_r_draw_indexed(en, MTLPrimitiveTypeTriangle, w, MTLIndexTypeUInt32, out.gpuAddress + off, (size_t)w * 4, inst, base, binst);
+        fx_note_expand(di ? "indexed-fan" : "fan", pr, count); return 1;
+    }
+    if (prim == 8 && count >= 4) {
+        int nq = (count - 2) / 2;
+        id<MTLBuffer> out; size_t off = arena_alloc((size_t)nq * 6 * 4, &out);
+        uint32_t *dst = (uint32_t *)((uint8_t *)out.contents + off); int w = 0;
+        for (int i = 0; i < nq; i++) {
+            int b0 = i * 2;
+            int a = di ? fx_index_at(src, di->itype, b0) : b0;
+            int b = di ? fx_index_at(src, di->itype, b0 + 1) : b0 + 1;
+            int c = di ? fx_index_at(src, di->itype, b0 + 2) : b0 + 2;
+            int d = di ? fx_index_at(src, di->itype, b0 + 3) : b0 + 3;
+            if (a < 0 || b < 0 || c < 0 || d < 0) continue;
+            dst[w++] = (uint32_t)a; dst[w++] = (uint32_t)b; dst[w++] = (uint32_t)d;
+            dst[w++] = (uint32_t)a; dst[w++] = (uint32_t)d; dst[w++] = (uint32_t)c;
+        }
+        if (w) enc_r_draw_indexed(en, MTLPrimitiveTypeTriangle, w, MTLIndexTypeUInt32, out.gpuAddress + off, (size_t)w * 4, inst, base, binst);
+        fx_note_expand(di ? "indexed-quad-strip" : "quad-strip", pr, count); return 1;
+    }
+    if (prim == 2) {
+        if (count < 2) return 1;
+        int nseg = count;
+        id<MTLBuffer> out; size_t off = arena_alloc((size_t)nseg * 2 * 4, &out);
+        uint32_t *dst = (uint32_t *)((uint8_t *)out.contents + off); int w = 0;
+        for (int i = 0; i < count; i++) {
+            int a = di ? fx_index_at(src, di->itype, i) : i;
+            int b = di ? fx_index_at(src, di->itype, (i + 1) % count) : (i + 1) % count;
+            if (a < 0 || b < 0) continue;
+            dst[w++] = (uint32_t)a; dst[w++] = (uint32_t)b;
+        }
+        if (w) enc_r_draw_indexed(en, MTLPrimitiveTypeLine, w, MTLIndexTypeUInt32, out.gpuAddress + off, (size_t)w * 4, inst, base, binst);
+        fx_note_expand(di ? "indexed-line-loop" : "line-loop", pr, count); return 1;
+    }
+    return 0;
+}
+static int fx_skip_key(const char *key) {
+    if (!key || !atomic_load(&g_fxskip_on)) return 0;
+    pthread_mutex_lock(&g_skip_mu);
+    int hit = 0; for (int i = 0; i < 4; i++) if (g_fxskip[i][0] && !strncmp(g_fxskip[i], key, 16)) hit = 1;
+    pthread_mutex_unlock(&g_skip_mu);
+    return hit;
+}
+static void fx_watch_draw(NvProg *pr, int prim, int count) {
+    int left = atomic_load(&g_fxwatch);
+    if (left <= 0 || !pr || !pr->sh[1]) return;
+    int interesting = prim != 4 && prim != 5;
+    interesting = interesting || S.color.blend_en || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS);
+    unsigned tw = R.has_rt && R.rt.color[0] ? R.rt.color[0]->d.width : 0, th = R.has_rt && R.rt.color[0] ? R.rt.color[0]->d.height : 0;
+    if (tw && th && tw <= 256 && th <= 256) interesting = 1;
+    if (!interesting) return;
+    static uint64_t frame; static int n; static char keys[24][17];
+    uint64_t fr = atomic_load(&g_cur_frame);
+    if (fr != frame) {
+        if (frame && n) {
+            atomic_fetch_sub(&g_fxwatch, 1);
+            char w[700], line[760]; mtl_shader_miss_window(w, sizeof w);
+            if (w[0]) { snprintf(line, sizeof line, "[fxmiss] %s", w); diag_append(line); }
+        }
+        frame = fr; n = 0;
+    }
+    if (n >= 24) return;
+    for (int i = 0; i < n; i++) if (!strncmp(keys[i], pr->sh[1]->key, 16)) return;
+    snprintf(keys[n], 17, "%.16s", pr->sh[1]->key); n++;
+    diag_note("[fx] F%llu prim=%d blend=%#x %u,%u,%u a=%u tgt=%ux%u n=%d fs=%.16s",
+        (unsigned long long)fr, prim, S.color.blend_en, S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb,
+        S.color.alpha_func, tw, th, count, pr->sh[1]->key);
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
@@ -10561,6 +10699,8 @@ frz_plain:;
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
     int prim = dw ? dw->prim : di->prim;
+    if (pr && pr->sh[1] && fx_skip_key(pr->sh[1]->key)) return;
+    fx_watch_draw(pr, prim, dw ? dw->count : di->count);
     MTLPrimitiveType mp;
     switch (prim) {
         case 0: mp = MTLPrimitiveTypePoint; break; case 1: mp = MTLPrimitiveTypeLine; break; case 3: mp = MTLPrimitiveTypeLineStrip; break;
@@ -10642,6 +10782,7 @@ frz_plain:;
     udc_note_draw(pr);
     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
+    if ((prim == 2 || prim == 6 || prim == 8) && fx_expand(en, prim, dw, di, pr)) return;
     if (dw && prim == 7) {   // 四边形：共享索引 0,1,2,0,2,3 | Quads: shared indices 0,1,2,0,2,3
         if (!g_quad_ib) {
             uint32_t n = 65536; uint32_t *ix = malloc(n * 6 * 4);
@@ -10653,7 +10794,7 @@ frz_plain:;
         if (dw->count && (dw->instances > 1 || dw->base_instance)) enc_r_draw_instanced(en, mp, dw->first, dw->count, dw->instances, dw->base_instance);
         else if (dw->count && dw->instances >= 0) enc_r_draw(en, mp, dw->first, dw->count);
     } else {
-        if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
+        if (prim == 7 || prim == 6 || prim == 2) { if (fx_expand(en, prim, NULL, di, pr)) return; RED_ONCE(20, "带索引的扩展图元 %d 画不出", prim); return; }
         void *mb; uint64_t mo;
         uint64_t gpu;
         if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }

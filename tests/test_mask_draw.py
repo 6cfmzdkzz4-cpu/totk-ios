@@ -49,6 +49,9 @@ class MaskDraw(unittest.TestCase):
         self.assertIn('static _Atomic int g_f207_depth;', MTL)
         self.assertNotIn('g_f207_depth = 1', MTL)
         self.assertIn('g_f207_inv = 1', MTL)
+        self.assertIn('g_fxquad = 1', MTL)
+        self.assertIn('indexed-quads', MTL)
+        self.assertNotIn('带索引的四边形未实现', MTL)
         for name in ('f207dump', 'f207border', 'f207zero', 'f207cmp', 'f207slot', 'f207depth', 'f207lod', 'f207vflip', 'f207fmt', 'f207const', 'f207view', 'f207save', 'f207inv', 'f207_invert_depth', 'tex_touch_note', 'f207_border_samp', 'f207_cmp_samp', 'f207_lod0_samp', 'scene_depth_note'):
             self.assertIn(name, MTL)
         self.assertIn('f207b1d79f3cc194', MTL)
