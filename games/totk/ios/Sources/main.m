@@ -135,10 +135,12 @@ void runtime_shortcut_help_toggle(void) {}
     self.window.rootViewController = [TOTKGameController new];
     [self.window makeKeyAndVisible];
 }
+- (void)sceneWillEnterForeground:(UIScene *)scene {(void)scene;extern void totk_audio_foreground(void);totk_audio_foreground();}
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     int requested=totk_simple_frame_cap_requested(NSUserDefaults.standardUserDefaults);
     totk_frame_cap_set(requested);runtime_ios_apply_frame_cap();
     runtime_device_motion_orientation((int)((UIWindowScene *)scene).interfaceOrientation);runtime_ios_foreground(1);[[TOTKCloudSave shared] checkForChanges];
+    extern void totk_audio_foreground(void);totk_audio_foreground();
 }
 - (void)sceneDidEnterBackground:(UIScene *)scene {(void)scene;runtime_ios_foreground(0);[[TOTKCloudSave shared] flushForBackground];}
 @end
@@ -237,6 +239,8 @@ void runtime_shortcut_help_toggle(void) {}
     NSString *commands = [docs stringByAppendingPathComponent:@"input.txt"];
     if (![fm fileExistsAtPath:commands]) [fm createFileAtPath:commands contents:[NSData data] attributes:nil];
     setenv("TOTK_INPUT_FILE", commands.fileSystemRepresentation, 0);
+    extern void totk_audio_session_start(void);
+    totk_audio_session_start();   /* before input flags and before RemoteIO starts */
     runtime_input_file_start();   /* constructors already ran, before this variable existed */
     setenv("TOTK_GAME_SLOT_DIR",[docs stringByAppendingPathComponent:@"game-slot"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PROOF_DIR",docs.fileSystemRepresentation,1);   // hash the 17 GB RomFS once, not on every launch

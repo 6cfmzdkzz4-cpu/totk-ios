@@ -163,7 +163,9 @@ static void input_file_on_line(const char *text, void *ctx) {
         } else if (!strncmp(line, "flag ", 5)) {
             /* "flag <name> <0|1>": switch a graphics behaviour while the game runs (A/B without restarting); rumble / gyro mute and unmute those */
             char name[64]; int v; if (sscanf(line + 5, "%63s %d", name, &v) != 2) runtime_fail("diagnostic flag needs <name> <0|1>");
-            extern void dm_gfx_set_flag(const char *name, int v); if (!runtime_hid_feedback_flag(name, v)) dm_gfx_set_flag(name, v);
+            extern void dm_gfx_set_flag(const char *name, int v);
+            extern int audio_host_restart_flag(const char *name, int v);
+            if (!runtime_hid_feedback_flag(name, v) && !audio_host_restart_flag(name, v)) dm_gfx_set_flag(name, v);
         } else if (!strncmp(line, "texdump ", 8)) {
             extern void dm_gfx_texdump_next(const char *path);
             line[strcspn(line, "\r\n")] = 0; if (!line[8] || !strstr(line + 8, "%d")) runtime_fail("diagnostic texdump path needs %d");

@@ -15,10 +15,13 @@
 #include "audio_effects.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "audio_host.h"
 
 #define MAX_FRAME 1024
 #define RING_FRAMES 16384            /* stereo frames, ~340 ms at 48 kHz */
@@ -36,9 +39,10 @@ typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   /* first mix buffer of each mix id */
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
-    AudioComponentInstance unit; int unit_ok;
+    AudioComponentInstance unit; int unit_ok, rate;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
     _Atomic int playing; int ready; _Atomic uint64_t missing_frames;
+    _Atomic int host_paused, unit_started; _Atomic uint64_t last_callback_ns;
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
     _Atomic uint64_t callback_frames,callback_nonzero;
     EffectState *effect; int *effect_order; unsigned effect_reported;
@@ -109,11 +113,13 @@ static int prefill_blocks(void) {   // read once before the device starts (audio
 static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
     (void)flags; (void)ts; (void)bus;
     Mixer *m = ctx; float *out = io->mBuffers[0].mData;
+    struct timespec cb; clock_gettime(CLOCK_MONOTONIC, &cb);
+    atomic_store_explicit(&m->last_callback_ns, (uint64_t)cb.tv_sec * 1000000000ull + (uint64_t)cb.tv_nsec, memory_order_release);
     atomic_fetch_add(&m->callback_frames,frames);
     unsigned epoch=atomic_load_explicit(&m->stop_epoch,memory_order_acquire);
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
     if(epoch!=m->callback_epoch){uint64_t until=atomic_load_explicit(&m->flush_until,memory_order_acquire);if(until>rd){rd=until<wr?until:wr;atomic_store_explicit(&m->rd,rd,memory_order_release);}have=wr-rd;m->callback_epoch=epoch;m->ready=0;}
-    if(!atomic_load_explicit(&m->playing,memory_order_acquire)){
+    if(atomic_load_explicit(&m->host_paused,memory_order_acquire) || !atomic_load_explicit(&m->playing,memory_order_acquire)){
         memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return noErr;
     }
     if(!m->ready){
@@ -132,6 +138,7 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
     return noErr;
 }
 static void output_open(Mixer *m, int rate) {
+    m->rate = rate; m->unit = NULL; m->unit_ok = 0; atomic_store(&m->unit_started, 0);
     if (getenv("TOTK_AUDIO_OFF")) { fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without a CoreAudio device\n"); return; }
 #if TARGET_OS_IPHONE
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, 0, 0};   /* session set up by the app */
@@ -145,16 +152,122 @@ static void output_open(Mixer *m, int rate) {
     if (AudioUnitSetProperty(m->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f) ||
         AudioUnitSetProperty(m->unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb) ||
         AudioUnitInitialize(m->unit) || AudioOutputUnitStart(m->unit)) {
-        fprintf(stderr, "[totk-audio] 【红】CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); return;
+        fprintf(stderr, "[totk-audio] 【红】CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); m->unit = NULL; return;
     }
-    m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
+    m->rate = rate; m->unit_ok = 1; atomic_store(&m->unit_started, 1);
+    struct timespec started; clock_gettime(CLOCK_MONOTONIC, &started);
+    atomic_store(&m->last_callback_ns, (uint64_t)started.tv_sec * 1000000000ull + (uint64_t)started.tv_nsec);
+    fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
 }
 static void output_push(Mixer *m, const float *lr, int frames) {
+    /* A stalled or interrupted device must not block the audren thread. Drop the block. */
+    if (atomic_load_explicit(&m->host_paused, memory_order_acquire)) return;
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
     if (m->unit_ok && wr + (uint64_t)frames - rd > RING_FRAMES) { atomic_fetch_add(&m->overruns, 1); return; }   /* device stalled: drop this frame */
     for (int i = 0; i < frames; i++) { uint64_t k = (wr + (uint64_t)i) % RING_FRAMES; m->ring[2 * k] = lr[2 * i]; m->ring[2 * k + 1] = lr[2 * i + 1]; }
     atomic_store_explicit(&m->wr, wr + (uint64_t)frames, memory_order_release);
     if (!m->unit_ok) atomic_store(&m->rd, wr + (uint64_t)frames);   /* no device: the ring only keeps the latest frames */
+}
+
+/* The live renderer. The emulated audren state stays up across a phone-call interruption; only this unit stops. */
+static Mixer *g_live;
+static pthread_mutex_t g_unit_mu = PTHREAD_MUTEX_INITIALIZER;
+static void (*g_session_restart)(void);
+static uint64_t mono_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+void audio_diag(const char *fmt, ...) {
+    char line[300]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    fprintf(stderr, "%s\n", line);
+    const char *in = getenv("TOTK_INPUT_FILE"); const char *slash = in ? strrchr(in, '/') : NULL;
+    if (!slash) return;
+    char path[1024]; if ((size_t)(slash - in) + 12 >= sizeof path) return;
+    snprintf(path, sizeof path, "%.*s/diag.txt", (int)(slash - in), in);
+    static pthread_mutex_t diag_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&diag_mu);
+    FILE *f = fopen(path, "a");
+    if (f) { fputs(line, f); if (!line[0] || line[strlen(line) - 1] != '\n') fputc('\n', f); fclose(f); }
+    pthread_mutex_unlock(&diag_mu);
+}
+static void drop_queued(Mixer *m) {
+    uint64_t wr = atomic_load_explicit(&m->wr, memory_order_acquire);
+    atomic_store_explicit(&m->rd, wr, memory_order_release);
+    atomic_store_explicit(&m->flush_until, wr, memory_order_release);
+    atomic_fetch_add_explicit(&m->stop_epoch, 1, memory_order_release);
+}
+static void output_stop_locked(Mixer *m) {
+    atomic_store_explicit(&m->host_paused, 1, memory_order_release);
+    if (m->unit && m->unit_ok) AudioOutputUnitStop(m->unit);
+    atomic_store(&m->unit_started, 0);
+    drop_queued(m);
+}
+static int output_start_locked(Mixer *m) {
+    if (!m->unit || !m->unit_ok) return 0;
+    drop_queued(m);
+    atomic_store(&m->last_callback_ns, mono_ns());
+    atomic_store_explicit(&m->host_paused, 0, memory_order_release);
+    OSStatus st = AudioOutputUnitStart(m->unit);
+    int ok = st == noErr;
+    atomic_store(&m->unit_started, ok);
+    if (!ok) atomic_store_explicit(&m->host_paused, 1, memory_order_release);
+    return ok;
+}
+static void output_dispose_locked(Mixer *m) {
+    if (m->unit && m->unit_ok) { AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+    m->unit = NULL; m->unit_ok = 0; atomic_store(&m->unit_started, 0);
+}
+void audio_host_set_restart_hook(void (*fn)(void)) { g_session_restart = fn; }
+int audio_host_set_interrupted(int began) {
+    pthread_mutex_lock(&g_unit_mu);
+    Mixer *m = g_live; int ok = 0;
+    if (m) { if (began) { output_stop_locked(m); ok = 1; } else ok = output_start_locked(m); }
+    pthread_mutex_unlock(&g_unit_mu);
+    return ok;
+}
+int audio_host_is_paused(void) {
+    pthread_mutex_lock(&g_unit_mu);
+    int paused = g_live && atomic_load(&g_live->host_paused);
+    pthread_mutex_unlock(&g_unit_mu);
+    return paused;
+}
+int audio_host_needs_restart(void) {
+    pthread_mutex_lock(&g_unit_mu);
+    Mixer *m = g_live; int need = 0;
+    if (m && m->rate) {
+        if (!m->unit_ok || !atomic_load(&m->unit_started) || atomic_load(&m->host_paused)) need = 1;
+        else {
+            uint64_t last = atomic_load(&m->last_callback_ns), now = mono_ns();
+            if (last && now > last + 500000000ull) need = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_unit_mu);
+    return need;
+}
+int audio_host_restart(int rebuild) {
+    pthread_mutex_lock(&g_unit_mu);
+    Mixer *m = g_live; int ok = 0;
+    if (m && m->rate) {
+        if (rebuild) {
+            int rate = m->rate;
+            atomic_store(&m->host_paused, 1);
+            output_dispose_locked(m);
+            output_open(m, rate);
+            if (m->unit_ok) { drop_queued(m); atomic_store(&m->host_paused, 0); ok = 1; }
+        } else {
+            output_stop_locked(m);
+            ok = output_start_locked(m);
+        }
+    }
+    pthread_mutex_unlock(&g_unit_mu);
+    return ok;
+}
+int audio_host_restart_flag(const char *name, int v) {
+    if (!name || strcmp(name, "audiorestart")) return 0;
+    if (v != 1) { audio_diag("[audio] restart err"); return 1; }
+    if (g_session_restart) g_session_restart();
+    else audio_diag(audio_host_restart(0) ? "[audio] restart ok" : "[audio] restart err");
+    return 1;
 }
 
 void audio_mixer_open(AudioRenderer *r) {
@@ -190,6 +303,7 @@ void audio_mixer_open(AudioRenderer *r) {
     }else fprintf(stderr,"[totk-audio] diagnostic capture unavailable (file exists or cannot be opened)\n");}
     prefill_blocks();   // decided before the device's callback can run
     output_open(m, r->param.sample_rate);
+    pthread_mutex_lock(&g_unit_mu); g_live = m; pthread_mutex_unlock(&g_unit_mu);
 }
 void audio_mixer_set_running(AudioRenderer *r,int running){
     Mixer *m=r->mixer;if(!m)return;
@@ -198,7 +312,10 @@ void audio_mixer_set_running(AudioRenderer *r,int running){
 }
 void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer; if (!m) return;
-    if (m->unit_ok) { AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+    pthread_mutex_lock(&g_unit_mu);
+    if (g_live == m) g_live = NULL;
+    output_dispose_locked(m);
+    pthread_mutex_unlock(&g_unit_mu);
     if(m->capture_worker){
         pthread_mutex_lock(&m->capture_lock);m->capture_closing=1;pthread_cond_signal(&m->capture_cond);pthread_mutex_unlock(&m->capture_lock);
         pthread_join(m->capture_thread,NULL);pthread_cond_destroy(&m->capture_cond);pthread_mutex_destroy(&m->capture_lock);free(m->capture_buf);
