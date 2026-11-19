@@ -29,6 +29,8 @@ void *runtime_applet_override(const char *name);
 void *runtime_swkbd_override(const char *name);   /* runtime/swkbd_host.c: nn::swkbd text entry with the Mac keyboard */
 void runtime_swkbd_probe(void);
 void runtime_swkbd_selftest(void);
+void runtime_swkbd_set_default(const char *name);   /* name used when the iOS dialog cannot be shown */
+const char *runtime_swkbd_default(void);
 void runtime_dump_threads(void);   /* threads.c: every guest thread's wait state and guest return chain (TOTK_INPUT_FILE "threads") */   /* diagnostic "kbtest": show the text entry bar from a thread of its own */
 void runtime_frame_step_pin(double ms);                  /* game_patches.c: pin the real-time frame step (diagnostics), 0 = real time */
 void runtime_frame_step_update(uint64_t now_ns);
@@ -39,7 +41,8 @@ void runtime_hle_trace_set(int mode);                    /* hle_stack.c: 1 count
 void runtime_hle_describe(unsigned index, char *out, size_t cap);   /* hle_stack.c: readable name of a host-call wrapper */
 /* Text entry bar in the game window (runtime/frontend.m, Mac): the player types on the keyboard, Return confirms (1, the text
    as UTF-8 in out), Escape cancels (0). The caller waits; give the virtual core up around it (runtime_core_away). */
-typedef struct { const char *prompt, *initial; int max_units, min_units, secure, digits_only; uint32_t disabled; } RuntimeTextRequest;
+typedef struct { const char *prompt, *initial; int max_units, min_units, secure, digits_only; uint32_t disabled; const char *ok_text; } RuntimeTextRequest;
+/* 1 confirmed, 0 cancelled, -1 the dialog could not be shown. */
 int runtime_front_text_input(const RuntimeTextRequest *req, char *out, size_t out_size);
 void runtime_front_text_test(const char *op, const char *text);   /* diagnostics: "type" text, "enter", "esc" into the open bar */
 int runtime_core_away(void);          /* runtime/threads.c: a guest thread gives its virtual core up around a long host wait */
@@ -115,6 +118,7 @@ void runtime_memory_probe(void);
 void runtime_input_key(unsigned code,int down);
 void runtime_input_file_start(void);   /* input.c: start the command file after TOTK_INPUT_FILE is set; a repeat is a no-op */
 void runtime_input_clear(void);
+void runtime_input_suppress(int on);   /* drop controller and key state while a system dialog has the screen */
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;

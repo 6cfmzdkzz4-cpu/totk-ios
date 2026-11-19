@@ -20,6 +20,7 @@
 #include "totk_ui_lang.h"
 #include <TargetConditionals.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +108,20 @@ static size_t clean(uint16_t *t, size_t n, size_t max, uint32_t disabled, int di
 }
 
 static int negative(void) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); return e ? atoi(e) : 0; }
+static void fallback_copy(char *out, size_t cap) {
+    const char *name = runtime_swkbd_default();
+    snprintf(out, cap, "%s", name && *name ? name : "Horse");
+}
+static void swkbd_diag(const char *fmt, ...) {
+    char line[300]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    fprintf(stderr, "%s\n", line);
+    const char *in = getenv("TOTK_INPUT_FILE"); const char *slash = in ? strrchr(in, '/') : NULL;
+    if (!slash) return;
+    char path[1024]; if ((size_t)(slash - in) + 12 >= sizeof path) return;
+    snprintf(path, sizeof path, "%.*s/diag.txt", (int)(slash - in), in);
+    FILE *f = fopen(path, "a");
+    if (f) { fputs(line, f); if (!line[0] || line[strlen(line) - 1] != '\n') fputc('\n', f); fclose(f); }
+}
 
 static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
     const uint8_t *arg = arg_ptr; uint64_t *str = out_string;
@@ -131,18 +146,23 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
              *header && (*guide || *sub) ? " — " : "", *header ? (*guide ? guide : sub) : "");
 
     char text[KB_LIMIT * 4 + 1] = ""; int confirmed = 0;
+    if (rd64(arg + 0x4e0) || rd64(arg + 0x4e8)) swkbd_diag("[swkbd] text check requested; reply ok");
+    swkbd_diag("[swkbd] launch mode=%u max=%d initial=%s", type, max_len, initial);
     const char *forced = getenv("TOTK_SWKBD_ANSWER");
     if (forced) {
         confirmed = strcmp(forced, "<cancel>") != 0;
         snprintf(text, sizeof text, "%s", strcmp(forced, "<initial>") ? forced : initial);
     } else {
-#if TARGET_OS_OSX
-        RuntimeTextRequest req = { prompt, initial, max_len, min_len, password != 0, type == KB_TYPE_NUMPAD, disabled };
+#if TARGET_OS_OSX || TARGET_OS_IPHONE
+        RuntimeTextRequest req = { prompt, initial, max_len, min_len, password != 0, type == KB_TYPE_NUMPAD, disabled, *ok ? ok : NULL };
         int away = runtime_core_away();   /* the other guest threads keep running while the player types */
-        confirmed = runtime_front_text_input(&req, text, sizeof text);
+        int presented = runtime_front_text_input(&req, text, sizeof text);
         runtime_core_back(&away);
+        if (presented < 0) { fallback_copy(text, sizeof text); confirmed = 1; swkbd_diag("[swkbd] dialog unavailable; using default"); }
+        else confirmed = presented;
 #else
-        fprintf(stderr, "[totk] keyboard: text entry is not available on this platform; cancelled\n");
+        fallback_copy(text, sizeof text); confirmed = 1;
+        fprintf(stderr, "[totk] keyboard: no dialog on this platform; using the default name\n");
 #endif
     }
     uint16_t u[KB_LIMIT * 2];
@@ -164,6 +184,7 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
     fprintf(stderr, "[totk] keyboard: \"%s\" (type %u, %d-%d characters, disabled keys %#x, %s out)%s -> %s%s%s\n", prompt, type, min_len,
             max_len, disabled, utf8 ? "UTF-8" : "UTF-16", forced ? " [TOTK_SWKBD_ANSWER]" : "", confirmed ? "\"" : "cancelled",
             confirmed ? shown : "", confirmed ? "\"" : "");
+    swkbd_diag("[swkbd] result=%s text=%s", confirmed ? "ok" : "cancel", password ? "(hidden)" : (confirmed ? shown : ""));
     return confirmed ? 0 : SWKBD_CANCELED;
 }
 
