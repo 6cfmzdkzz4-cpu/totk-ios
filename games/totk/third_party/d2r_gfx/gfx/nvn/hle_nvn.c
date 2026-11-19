@@ -32,8 +32,17 @@
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
 #include "../../../../runtime/totk_live_display.h"
+#include "../../../../runtime/totk_frame_cap.h"
 #include "nvn_frame_geometry.h"
 extern TotkLiveSource runtime_live_display_finish_interval(uint64_t frame) __attribute__((weak_import));
+/* Graphics fixtures that do not link runtime/totk_frame_cap.c still pace from
+   the environment. The app's strong definitions own the persisted selection. */
+__attribute__((weak)) int totk_frame_cap_get(void) {
+    const char *env = getenv("TOTK_FPS_CAP");
+    if (!env || !*env) return 0;
+    return totk_frame_cap_normalize(atoi(env));
+}
+__attribute__((weak)) void totk_frame_cap_set(int hz) { (void)hz; }
 extern float runtime_aspect_now(void) __attribute__((weak_import));
 // Standalone graphics fixtures can keep the legacy static presenter. The real
 // renderer provides strong implementations carrying the entire bound interval.
@@ -47,6 +56,7 @@ __attribute__((weak,noinline)) void mtl_present_bind_source(TotkLiveSource sourc
 #include <sys/mman.h>
 #include <mach/mach.h>
 #include <TargetConditionals.h>
+#include <stdlib.h>
 #include <unistd.h>
 #if TARGET_OS_OSX
 #define DM_MEM_CAP_DEFAULT_GB 24
@@ -2299,7 +2309,9 @@ static void tsummary(uint64_t frame) {
         static const char *why[] = {"no-program", "zero-source", "defer-take", "render-disabled", "raster-discard", "cull-both", "scissor-empty", "deferred", "no-encoder", "no-pipeline", "viewport-empty", "primitive",
                                     "clear-render-disabled", "cond-disabled", "cond-unknown", "shader-missing"};   // TOTK: 12-14 conditional rendering (see cond_eval); 15 a shader variant the iPhone does not have yet
         for (int i = 0; i < 16; i++) { uint64_t d = g_draw_skip[i] - prev[i]; prev[i] = g_draw_skip[i]; if (d && o < sizeof b - 48) o += snprintf(b + o, sizeof b - o, " %s=%llu", why[i], (unsigned long long)d); }
-        if (o) LOG("[nvn] TOTK 回放丢弃的绘制 至帧 %llu:%s", frame, b); }
+        if (o) LOG("[nvn] TOTK 回放丢弃的绘制 至帧 %llu:%s", frame, b);
+        { extern void mtl_shader_miss_window(char *buf, size_t cap); char w[1024]; mtl_shader_miss_window(w, sizeof w);
+          if (w[0]) LOG("[nvn] shader-missing 至帧 %llu：%s", frame, w); } }
       { static uint64_t py, pk, pw; uint64_t cy = atomic_load(&g_cum_sub_cyc), ck = atomic_load(&g_cum_sub_sys_ns), cw = atomic_load(&g_cum_sub_wall_ns);
         if (pf && frame > pf && ci > pi && cy > py) { double nf = (double)(frame - pf), cyc = (double)(cy - py), cpu = (double)(cc - pc);
           qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp);
@@ -2462,7 +2474,9 @@ static void present_cfg(const win_t *o) {
     int realtime = !(rt && !strcmp(rt, "0"));
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
-      g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
+      int requested_cap = totk_frame_cap_get();
+      g_uncapped = !e && !requested_cap && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ;
+      if (requested_cap) LOG("[nvn] frame cap %d Hz", requested_cap); }
     if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] 不限帧率（TOTK_UNCAPPED，默认开；=0 关）：不等显示器刷新，自己的时钟上限 %d 帧（TOTK_UNCAPPED_HZ）；显示器 %d Hz 每次刷新显示最新一帧%s", g_hz, scr,
                                        mfx_enabled() ? "（补帧开着时暂停：每两次刷新一帧）" : "（补帧打开时暂停，2 键）"); }
     if (!g_hz) LOG("[nvn] 【警告】DM_PRESENT_HZ=0：不限帧率，帧节奏非真机，界面逻辑可能偏离（仅供性能剖析，不能用于判据 / 对拍）");
@@ -2499,8 +2513,9 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_HALF ? "补帧 刷新率一半：跟随显示器、每两次刷新一帧" :
                                     m == MFX_MAX ? (g_uncapped ? "补帧 不限帧：不限帧率，每帧补一帧" : "补帧 不限帧：按游戏的出图间隔，每帧补一帧") :
                                     g_uncapped ? "补帧关：不限帧率" : "补帧关：按游戏的出图间隔"); was = m; }
-    if (m == MFX_30) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    uint64_t period = m == MFX_30 ? 1000000000ull / 30 : hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    int applied_cap = totk_frame_cap_applied_now();
+    return applied_cap ? totk_frame_cap_pace(period, applied_cap) : period;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */

@@ -98,7 +98,8 @@ static void ring_output(void){
     for(int n=0;n<7;n++)output_push(m,samples,240);pull(m,NULL,NULL,0,512,&io);near(out[0],.25f,"rebuffer recovery");atomic_store(&m->playing,0);pull(m,NULL,NULL,0,512,&io);check(atomic_load(&m->rd)==atomic_load(&m->wr)&&atomic_load(&m->underruns)==1,"stop flush without underrun");
     AudioRenderer r={.mixer=m};audio_mixer_set_running(&r,1);for(int n=0;n<8;n++)output_push(m,samples,240);audio_mixer_set_running(&r,0);audio_mixer_set_running(&r,1);
     for(int k=0;k<480;k++)samples[k]=.5f;for(int n=0;n<8;n++)output_push(m,samples,240);pull(m,NULL,NULL,0,512,&io);near(out[0],.5f,"rapid stop/start drops stale queued audio");check(atomic_load(&m->underruns)==1,"resume keeps underrun accounting");
-    atomic_store(&m->rd,0);atomic_store(&m->wr,RING_FRAMES);uint64_t before=atomic_load(&m->wr);output_push(m,samples,240);check(atomic_load(&m->wr)==before&&atomic_load(&m->overruns)==1,"full ring drops atomically");free(m);
+    atomic_store(&m->rd,0);atomic_store(&m->wr,RING_FRAMES);uint64_t before=atomic_load(&m->wr);output_push(m,samples,240);check(atomic_load(&m->wr)==before&&atomic_load(&m->overruns)==1,"full ring drops atomically");
+    atomic_store(&m->host_paused,1);atomic_store(&m->wr,0);atomic_store(&m->rd,0);output_push(m,samples,240);check(atomic_load(&m->wr)==0,"interruption drops samples instead of blocking");atomic_store(&m->host_paused,0);free(m);
     m=calloc(1,sizeof *m);m->frame=240;m->unit_ok=1;atomic_store(&m->playing,1);
     for(int n=0;n<16 && !m->ready;n++){output_push(m,samples,240);pull(m,NULL,NULL,0,240,&io);}
     check(m->ready,"playback starts after bounded prefill");

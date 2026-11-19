@@ -215,6 +215,22 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     if (no_translator()) {
     // No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.
     // A miss records the complete request (with the guest code bytes) under shader-requests/ for ios/tools/fill_shaders.py.
+    // If that translation is already in the cache (a pack merged after this process cached a miss), compile it now.
+    NSString *metalPath = [totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant];
+    NSString *reflPath = [totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant];
+    if ([NSFileManager.defaultManager fileExistsAtPath:metalPath] && [NSFileManager.defaultManager fileExistsAtPath:reflPath]) {
+        NSData *jd = [NSData dataWithContentsOfFile:reflPath];
+        NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+        if ([refl isKindOfClass:[NSDictionary class]]) {
+            [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
+            if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
+            [g_msl_checked addObject:variant];
+            [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
+            pthread_mutex_unlock(&g_rt_lock);
+            LOG("[shader-fill] adopted cached metal %s", variant.UTF8String);
+            return variant;
+        }
+    }
     rq[@"code_hex"] = hex(code + skip, c1t - skip);
     [NSFileManager.defaultManager createDirectoryAtPath:@"shader-requests" withIntermediateDirectories:YES attributes:nil error:nil];
     /* A miss no longer stops the game: the caller skips the draws / dispatches that need this variant (draw-skip reason
@@ -225,7 +241,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         [missed addObject:variant];
         [[json_string(rq) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[NSString stringWithFormat:@"shader-requests/%@.json", variant] atomically:YES];
         totk_contrib_add(shader, answers);   // not in the prepared seed, so not in the shared shader list yet
-        LOG("[shader-miss] %s %s 不在手机的翻译缓存里：跳过用到它的绘制，请求已存 shader-requests/（第 %lu 个；在 Mac 上 ios/tools/fill_shaders.py 补上后下次启动预热）",
+        LOG("[shader-miss] %s %s 不在手机的翻译缓存里：跳过用到它的绘制，请求已存 shader-requests/（第 %lu 个；Mac 上 ios/tools/fill_shaders.py 推进 shader-fill/ 后，本局下一帧现编）",
             stage_name.UTF8String, variant.UTF8String, (unsigned long)missed.count);
     }
     pthread_mutex_unlock(&g_rt_lock);
@@ -259,6 +275,24 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     if (g_translated <= 8 || g_translated % 100 == 0) LOG("[shader] translated %llu: %s %s", (unsigned long long)g_translated, stage_name.UTF8String, variant.UTF8String);
     pthread_mutex_unlock(&g_rt_lock);
     return variant;
+}
+
+uint64_t totk_rt_import_fill(void) {
+#if !TARGET_OS_IPHONE
+    return 0;
+#else
+    NSString *dir = totk_rt_dir();
+    if (!dir) return 0;
+    NSDictionary *fill = totk_fill_import(@"shader-fill", dir);
+    NSUInteger n = [fill[@"imported_files"] unsignedIntegerValue];
+    for (NSString *why in fill[@"rejected"]) LOG("【红】[shader-fill] 丢弃不完整的着色器包 %s（请在 Mac 上重新运行 fill_shaders.py）", why.UTF8String);
+    if (!n) return 0;
+    pthread_mutex_lock(&g_rt_lock);
+    [g_variants removeAllObjects];
+    pthread_mutex_unlock(&g_rt_lock);
+    LOG("[shader-fill] 运行中合并 %lu 个文件，缺的变体下一帧现编", (unsigned long)n);
+    return (uint64_t)n;
+#endif
 }
 
 void totk_rt_counts(uint64_t *fresh, int64_t *total, uint64_t *last_new_ns) {

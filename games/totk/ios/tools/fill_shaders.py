@@ -5,7 +5,7 @@ iOS has no shader translator. On a miss the game skips the draws that need the v
 (variant, stage, guest code) to Documents/shader-requests/ (third_party/d2r_gfx/gfx/nvn/totk_shader_rt.m). This tool
 pulls those requests, translates them with the Mac's runtime service (build/shader-service/totk_xlate) into the Mac
 cache, compiles device metallibs, and pushes one pack in the startup-seed format to Documents/shader-fill/. The game
-checks and merges the pack on its next start (totk_fill_import) and warms the new variants in the background.
+checks and merges the pack on its next start, and also while it is running (totk_rt_import_fill), then compiles the new variants.
 usage: fill_shaders.py --tree <work tree> --device <id> [--bundle-id <id>] [--requests <dir>] [--with-done] [--no-push]"""
 import argparse, concurrent.futures, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path

@@ -2,6 +2,7 @@
    verified writable vtable slots and delegates the original calculation intact. */
 #include "totk_live_display.h"
 #include "totk_live_reservations.h"
+#include "totk_stable_aspect.h"
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <stdint.h>
@@ -83,6 +84,10 @@ TotkLiveSource runtime_live_display_finish_interval(uint64_t frame) {
     next.requested_generation=requested_source.generation;
     next.fallback=requested_fallback || completed.hud_misses!=0;
     if(next.fallback)next.aspect=4.0/3.0;
+    /* Dialogue misses already select 4:3. Stable mode also keeps gameplay,
+       cutscenes and a qualified HUD on that same camera instead of tracking
+       the device aspect and stretching the framebuffer. */
+    if(totk_stable_aspect_on())next.aspect=TOTK_STABLE_CONTENT_ASPECT;
     int changed=next.aspect!=active_source.aspect || next.width!=active_source.width || next.height!=active_source.height ||
                 next.scale!=active_source.scale || next.orientation!=active_source.orientation || next.fallback!=active_source.fallback ||
                 next.requested_generation!=active_source.requested_generation ||

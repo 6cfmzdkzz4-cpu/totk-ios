@@ -8,6 +8,8 @@
 #include "runtime.h"
 #include "totk_scene_geometry.h"
 #include "totk_live_display.h"
+#include "totk_stable_aspect.h"
+#include "totk_frame_cap.h"
 #include "totk_ui_lang.h"
 static CAMetalLayer *metalLayer;
 static UIView *bootOverlay;
@@ -91,7 +93,106 @@ void runtime_ios_settings_open(int open){
 }
 void runtime_ios_foreground(int active){app_active_changed(active);}
 void runtime_front_request_close(void){fprintf(stderr,"[totk] close requested; iOS apps are closed by the user\n");}
-void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf(stderr,"[totk] text entry test \"%s\" ignored: iOS has no text entry bar (the keyboard request is cancelled)\n",op?op:"");}
+/* Software keyboard (nn::swkbd::ShowKeyboard). The guest thread waits here; UIKit shows the field on the main thread. */
+@interface TOTKSwkbdField:NSObject<UITextFieldDelegate>
+@property int maxUnits,digitsOnly; uint32_t disabled;
+@end
+@implementation TOTKSwkbdField
+-(BOOL)allowed:(unichar)c{
+ BOOL digit=c>='0'&&c<='9';uint32_t d=self.disabled;
+ if(self.digitsOnly&&!digit)return NO;
+ if(c<0x20||c==0x7f)return NO;
+ if((d&1u<<1&&c==' ')||(d&1u<<2&&c=='@')||(d&1u<<3&&c=='%')||(d&1u<<4&&c=='/')||(d&1u<<5&&c=='\\')||(d&1u<<6&&digit))return NO;
+ return YES;
+}
+-(BOOL)textField:(UITextField *)field shouldChangeCharactersInRange:(NSRange)range replacementString:(NSString *)s{
+ if(s.length==0)return YES;
+ if(self.maxUnits>0 && field.text.length-range.length+s.length>(NSUInteger)self.maxUnits)return NO;
+ __block BOOL ok=YES;
+ [s enumerateSubstringsInRange:NSMakeRange(0,s.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *sub,NSRange r,NSRange er,BOOL *stop){
+  (void)r;(void)er;
+  if(sub.length==1&&![self allowed:[sub characterAtIndex:0]]){ok=NO;*stop=YES;}
+ }];
+ return ok;
+}
+@end
+static TOTKSwkbdField *swkbdDelegate;
+static __weak UITextField *swkbdField;
+static void (^swkbdFinish)(NSString *);
+static UIView *iosHost;
+static void touch_suspend(BOOL on){
+ Class pad=NSClassFromString(@"TOTKTouchPad"); if(!pad||!iosHost)return;
+ for(UIView *v in iosHost.subviews) if([v isKindOfClass:pad]) [v setValue:@(on) forKey:@"suspended"];
+}
+static UIViewController *top_controller(void){
+ UIView *view=(UIView *)metalLayer.delegate;
+ UIViewController *top=view.window.rootViewController;
+ if(!top) top=UIApplication.sharedApplication.keyWindow.rootViewController;
+ while(top.presentedViewController) top=top.presentedViewController;
+ return top;
+}
+void runtime_front_text_test(const char *op,const char *text){
+ NSString *o=[NSString stringWithUTF8String:op?op:""],*t=[NSString stringWithUTF8String:text?text:""]?:@"";
+ dispatch_async(dispatch_get_main_queue(), ^{
+  UITextField *field=swkbdField; void(^finish)(NSString *)=swkbdFinish;
+  if(!field||!finish){fprintf(stderr,"[totk] keyboard test: no text entry is open\n");return;}
+  if([o isEqualToString:@"type"]) field.text=[field.text stringByAppendingString:t];
+  else if([o isEqualToString:@"enter"]) finish(field.text?:@"");
+  else if([o isEqualToString:@"esc"]) finish(nil);
+  fprintf(stderr,"[totk] keyboard test: %s -> field \"%s\"\n",o.UTF8String,field.text.UTF8String?:"");
+ });
+}
+int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_size){
+ if(!req||!out||!out_size)return -1;
+ if(pthread_main_np()){fprintf(stderr,"[swkbd] dialog refused on the main thread\n");return -1;}
+ NSString *prompt=[NSString stringWithUTF8String:req->prompt?req->prompt:""]?:@"";
+ NSString *initial=[NSString stringWithUTF8String:req->initial?req->initial:""]?:@"";
+ NSString *okTitle=[NSString stringWithUTF8String:req->ok_text&&req->ok_text[0]?req->ok_text:"OK"]?:@"OK";
+ int maxU=req->max_units,minU=req->min_units>0?req->min_units:1,digits=req->digits_only,secure=req->secure;uint32_t dis=req->disabled;
+ __block NSString *result=nil; __block int failed=0, signaled=0;
+ dispatch_semaphore_t sem=dispatch_semaphore_create(0);
+ dispatch_async(dispatch_get_main_queue(), ^{
+  void (^signal)(void)=^{ if(signaled)return; signaled=1; dispatch_semaphore_signal(sem); };
+  UIViewController *top=top_controller();
+  if(!top||top.presentedViewController||top.isBeingDismissed){failed=1;signal();return;}
+  runtime_input_clear();runtime_input_suppress(1);touch_suspend(YES);
+  TOTKSwkbdField *delegate=[TOTKSwkbdField new];delegate.maxUnits=maxU;delegate.digitsOnly=digits;delegate.disabled=dis;swkbdDelegate=delegate;
+  UIAlertController *alert=[UIAlertController alertControllerWithTitle:prompt.length?prompt:@(TOTK_UI("输入文字","Enter text")) message:nil preferredStyle:UIAlertControllerStyleAlert];
+  [alert addTextFieldWithConfigurationHandler:^(UITextField *field){
+   field.text=initial;field.delegate=delegate;field.clearButtonMode=UITextFieldViewModeWhileEditing;
+   field.secureTextEntry=secure;field.keyboardType=digits?UIKeyboardTypeNumberPad:UIKeyboardTypeDefault;
+   field.autocorrectionType=UITextAutocorrectionTypeNo;swkbdField=field;
+  }];
+  __block id note=nil;
+  void (^finish)(NSString *, int)=^(NSString *text, int dismiss){
+   if(!swkbdFinish)return; swkbdFinish=nil; swkbdField=nil; swkbdDelegate=nil;
+   if(note) [NSNotificationCenter.defaultCenter removeObserver:note];
+   result=[text copy]; runtime_input_suppress(0); touch_suspend(NO);
+   if(dismiss) [top dismissViewControllerAnimated:YES completion:signal];
+   else signal();
+  };
+  swkbdFinish=^(NSString *text){ finish(text, 1); };
+  UIAlertAction *ok=[UIAlertAction actionWithTitle:okTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){(void)a;
+   NSString *s=alert.textFields.firstObject.text?:@""; finish((NSInteger)s.length>=minU?s:nil,0);
+  }];
+  ok.enabled=initial.length>=(NSUInteger)minU;
+  note=[NSNotificationCenter.defaultCenter addObserverForName:UITextFieldTextDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){
+   UITextField *field=alert.textFields.firstObject; if(n.object==field) ok.enabled=field.text.length>=(NSUInteger)minU;
+  }];
+  [alert addAction:[UIAlertAction actionWithTitle:@(TOTK_UI("取消","Cancel")) style:UIAlertActionStyleCancel handler:^(UIAlertAction *a){(void)a;finish(nil,0);}]];
+  [alert addAction:ok];
+  [top presentViewController:alert animated:YES completion:^{ [alert.textFields.firstObject becomeFirstResponder]; }];
+  fprintf(stderr,"[swkbd] dialog shown (%s)\n",prompt.UTF8String);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)NSEC_PER_SEC),dispatch_get_main_queue(),^{
+   if(swkbdFinish && !alert.presentingViewController && !alert.beingPresented){failed=1;finish(nil,0);}
+  });
+ });
+ dispatch_semaphore_wait(sem,DISPATCH_TIME_FOREVER);
+ runtime_input_suppress(0);
+ if(failed||!result)return failed?-1:0;
+ snprintf(out,out_size,"%s",result.UTF8String?result.UTF8String:"");
+ return 1;
+}
 
 @interface TOTKVsync:NSObject
 @end
@@ -99,6 +200,14 @@ void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf
 -(void)tick:(CADisplayLink *)l{(void)l;pthread_mutex_lock(&vsyncLock);for(unsigned i=0;i<vsyncCount;i++)hle_signal_system_event(vsyncEvents[i]);pthread_mutex_unlock(&vsyncLock);}
 @end
 static TOTKVsync *vsyncTarget;
+static void apply_display_link_cap(void) {
+    if(!displayLink)return;
+    int hz=totk_frame_cap_applied_now();
+    if(hz!=30 && hz!=60)hz=60;
+    displayLink.preferredFrameRateRange=CAFrameRateRangeMake(hz,hz,hz);
+    fprintf(stderr,"[totk] display link pacing %d Hz\n",hz);
+}
+void runtime_ios_apply_frame_cap(void) {apply_display_link_cap();}
 
 /* Baseline for the selected signed preparation, including explicit fallback. */
 int runtime_ios_live_display_profile(void) {
@@ -133,13 +242,13 @@ int runtime_ios_update_geometry(CAMetalLayer *layer,UIView *host){
  if(CGSizeEqualToSize(layer.drawableSize,pixels) && layer.contentsScale==scale)return sceneChanged;
  layer.contentsScale=scale;layer.drawableSize=pixels;
  mtl_present_geometry_changed(); /* atomic request; worker owns interpolation history */
- fprintf(stderr,"[totk-display] drawable %ux%u scale %.3f baseline %.6f live-narrow=%d\n",g.pixel_width,g.pixel_height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile());
+ fprintf(stderr,"[totk-display] drawable %ux%u scale %.3f baseline %.6f live-narrow=%d stable=%d\n",g.pixel_width,g.pixel_height,scale,runtime_ios_picture_aspect(),runtime_ios_live_display_profile(),totk_stable_aspect_on());
  return 1;
 }
 
 /* Called on the main thread by the app before the game thread starts. */
 void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
- bootStartNS=runtime_now_ns();
+ iosHost=host;bootStartNS=runtime_now_ns();
  metalLayer=layer;metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.framebufferOnly=NO;
  runtime_ios_update_geometry(layer,host);
  bootOverlay=[[UIView alloc] initWithFrame:host.bounds];bootOverlay.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
@@ -156,7 +265,7 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(1);}];
  runtime_feedback_focus(UIApplication.sharedApplication.applicationState==UIApplicationStateActive);
  vsyncTarget=[TOTKVsync new];displayLink=[CADisplayLink displayLinkWithTarget:vsyncTarget selector:@selector(tick:)];
- displayLink.preferredFrameRateRange=CAFrameRateRangeMake(60,60,60);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+ apply_display_link_cap();[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 /* The app already runs the loader on a game thread with a large stack; the event loop belongs to UIKit. */
 void runtime_front_run(void(*callback)(void)){

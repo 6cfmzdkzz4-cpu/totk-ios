@@ -79,6 +79,40 @@ the first row's session): the rows differ by no more than a session varies. No s
   (before) or at the draw (now). What removes them from play is the shared shader list (`docs/shader-list.md`),
   whose rows the warm-up builds before the world shows.
 
+## iOS build 28, one sanitized session
+
+A build from `803f81b` logged a finished background warm-up of 19,892 shaders,
+2,119 render pipelines and 158 compute pipelines in 30,758.6 ms on one library
+thread. Runtime library compilation for that warm-up was 0, and the seed import
+count was 0 because the local cache was already present. The startup line for
+the legacy `b-<chain>` metallib directory can be absent while those precompiled
+variant libraries still load. That directory is not the runtime cache.
+
+After that warm-up, 213 of 325 logged long frames still created at least one new
+pipeline. One sample at 263.91 s was an 85.9 ms frame with one new pipeline, no
+new library, 53.8 ms of creation and 18.4 ms of GPU time. The largest creation
+time among the samples was 1,749.7 ms. `pso_get` compiles a pipeline that is not
+already built on the submit thread before the draw that needs it. Skipping that
+draw, or guessing every attachment combination, is not a safe substitute. The
+warmed list does not cover every pipeline play reaches. A pipeline recorded in
+`pso_user.tsv` can be built by the next launch's warm-up; the first time it is
+drawn, the frame waits. Some long frames in the same log created neither a
+pipeline nor a library, so shader creation is not the only hitch. These figures
+are that session's log, not a new measurement and not a claim that another
+device matches them.
+
+The pipelines created during play are appended to `pso_user.tsv` and
+`pso_collected.tsv`. The next launch's warm-up builds saved keys before it
+reloads the prepared library list. `newRenderPipelineState` remains the
+creation call, including for a saved key the warm-up has not reached; there is
+no separate Metal binary archive. A submit-thread log line, `learned pipeline
+compiled on the submit thread`, means a key that was already on disk was still
+built during play. A second session on the same documents, without deleting
+`save/pso_user.tsv` or the shader cache, is the check: the warm-up count should
+include the previous session's new render rows, and that log line should stay
+quiet for those keys. Keys absent from the previous file are still first
+encounters. This has not been run on a device.
+
 ## The contributor's observation
 
 On an Apple M3 (24 GB, macOS 27.2, game 1.0.0) one session logged 32 long frames above one second, all with

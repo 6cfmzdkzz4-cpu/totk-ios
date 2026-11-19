@@ -1,5 +1,7 @@
 #include "game_patches.h"
 #include "aspect_patch.h"
+#include "free_autobuild.h"
+#include "totk_frame_cap.h"
 #include "game_version.h"
 #include "world_survey.h"
 #include <TargetConditionals.h>
@@ -148,9 +150,11 @@ static void patch_realtime(Module *m) {
     for (size_t i = 0; i < sizeof sites / sizeof *sites; i++)
         put_word(m, sites[i].off, repl[i], "real-time frame step");
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
-    atomic_store(frame_step_data, frame_step_bits(1.0f / 60.0f));
-    fprintf(stderr,"[totk] real-time frame step: %zu verified instructions; initial 16.67 ms, sampled at each present\n",
-            sizeof sites / sizeof *sites);
+    int applied_cap = totk_frame_cap_applied_now();
+    float initial = applied_cap ? 1.0f / (float)applied_cap : 1.0f / 60.0f;
+    atomic_store(frame_step_data, frame_step_bits(initial));
+    fprintf(stderr,"[totk] real-time frame step: %zu verified instructions; initial %.2f ms, sampled at each present\n",
+            sizeof sites / sizeof *sites, initial * 1000.0f);
 }
 
 /* Render resolution (TOTK_RENDER_RES=<w>x<h>, e.g. 960x540).
@@ -458,6 +462,59 @@ static void patch_ios_aspect(Module *m) {
 
 #include "totk_live_display.h"
 
+static uint8_t *free_autobuild_flag;
+int free_autobuild_ready(void) { return free_autobuild_flag != NULL; }
+void free_autobuild_set(int enabled) { if (free_autobuild_flag) *free_autobuild_flag = enabled ? 1 : 0; }
+
+static int fa_hash_matches(const uint32_t words[3]) {
+    uint8_t digest[32], expect[32];
+    fa_sha256((const uint8_t *)words, 12, digest);
+    if (!fa_parse_sha256(FA_ORIGINAL_SHA256, expect)) return 0;
+    return memcmp(digest, expect, 32) == 0;
+}
+static void free_autobuild_install(Module *m) {
+    static const uint64_t sites[3] = {FA_SITE_BL, FA_SITE_LDR, FA_SITE_ADD};
+    uint64_t stub_base = ((m->text_end + 15) & ~15ULL) + 128; /* after the aspect and live-display veneers */
+    uint64_t page_end = (m->text_end + 0x3fff) & ~0x3fffULL;
+    uint64_t data = (m->file_size + 0x3fff) & ~0x3fffULL;
+    int plain = 1; uint32_t originals[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++) {
+        uint32_t have; memcpy(&have, m->base + sites[i], 4);
+        if (fa_kind(have) != i) plain = 0; else originals[i] = have;
+    }
+    if (plain) {
+        if (!fa_hash_matches(originals)) runtime_fail("free autobuild: original instructions do not match the pinned 1.0.0 sites");
+        if (CODE_PATCHED_AT_BUILD || !getenv("TOTK_FREE_AUTOBUILD_EXPORT")) return;
+    }
+    if (stub_base + FA_STUB_WORDS * 12 > page_end || data + FA_FLAG_OFFSET >= m->size)
+        runtime_fail("free autobuild: no room after the existing text veneers");
+    if (plain) {
+        for (int i = 0; i < 3; i++) {
+            uint64_t stub = stub_base + (uint64_t)i * FA_STUB_WORDS * 4;
+            for (unsigned b = 0; b < FA_STUB_WORDS * 4; b++) if (m->base[stub + b]) runtime_fail("free autobuild: text padding is already used");
+            uint32_t code[FA_STUB_WORDS];
+            if (!fa_stub(code, originals[i], sites[i], stub, data)) runtime_fail("free autobuild: cannot encode the veneer");
+            uint32_t jump = fa_branch(sites[i], stub);
+            memcpy(m->base + stub, code, sizeof code); memcpy(m->base + sites[i], &jump, 4);
+        }
+    } else {
+        for (int i = 0; i < 3; i++) {
+            uint64_t stub = stub_base + (uint64_t)i * FA_STUB_WORDS * 4;
+            uint32_t have, stored; memcpy(&have, m->base + sites[i], 4); memcpy(&stored, m->base + stub + 60, 4);
+            if (have != fa_branch(sites[i], stub) || fa_kind(stored) != i) runtime_fail("free autobuild: signed veneer is absent or incomplete");
+            originals[i] = stored;
+            uint32_t code[FA_STUB_WORDS];
+            if (!fa_stub(code, stored, sites[i], stub, data) || memcmp(m->base + stub, code, sizeof code))
+                runtime_fail("free autobuild: signed veneer does not match the pinned sites");
+        }
+        if (!fa_hash_matches(originals)) runtime_fail("free autobuild: original instructions do not match the pinned 1.0.0 sites");
+    }
+    free_autobuild_flag = m->base + data + FA_FLAG_OFFSET;
+    free_autobuild_set(getenv("TOTK_FREE_AUTOBUILD") && strcmp(getenv("TOTK_FREE_AUTOBUILD"), "0"));
+    fprintf(stderr, "[totk] experimental Free Autobuild veneer %s for this launch\n",
+            *free_autobuild_flag ? "on" : "off");
+}
+
 void runtime_game_patches(Module *m) {
     runtime_survey_init(m);
     const size_t n = sizeof fps60_sites / sizeof fps60_sites[0];
@@ -480,6 +537,7 @@ void runtime_game_patches(Module *m) {
             }
         }
         fprintf(stderr, "[totk] embedded main: real-time frame step and 60 FPS patch (%zu instructions) applied at build time\n", n);
+        free_autobuild_install(m);
         return;
     }
     patch_pchtxt(m);   /* first: the runtime's own patches check the original words they replace */
@@ -489,6 +547,7 @@ void runtime_game_patches(Module *m) {
     patch_output_res(m);
     patch_ios_aspect(m);
     runtime_live_display_install(m);
+    free_autobuild_install(m);
     patch_trap(m);
 #if defined(TOTK_GAME_V121)
     { static const uint64_t sites[] = {0xcb4b10, 0x12521cc, 0x19b36f0, 0x1ecdf68};   /* camera x2, viewport x2 (aspect_patch.h) */

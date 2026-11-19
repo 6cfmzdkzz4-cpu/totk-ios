@@ -1,5 +1,6 @@
 /* Native keyboard and macOS gamepad backed full-key controller. State ABI follows libnx HID. */
 #include "runtime.h"
+#include "input_file_start.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -16,6 +17,14 @@ _Static_assert(sizeof(NpadState)==40,"Npad full-key ABI");
 static pthread_mutex_t inputLock=PTHREAD_MUTEX_INITIALIZER;
 static unsigned char keys[128];static uint64_t pending;
 static uint32_t styles=1;static bool enabled,allowed=true;static int holdType;
+static _Atomic int input_suppressed;
+static char swkbd_default_name[64] = "Horse";
+void runtime_swkbd_set_default(const char *name) {
+    if (!name || !*name || strlen(name) >= sizeof swkbd_default_name) return;
+    snprintf(swkbd_default_name, sizeof swkbd_default_name, "%s", name);
+    fprintf(stderr, "[swkbd] default=%s\n", name);
+}
+const char *runtime_swkbd_default(void) { return swkbd_default_name; }
 static int64_t sample;static uint64_t padSeen;
 /* F/T/H/G map the D-pad left/up/right/down, keeping both analog-stick mappings independent. */
 static uint64_t button(unsigned code){switch(code){case 38:return 1;case 40:case 49:return 2;case 34:return 4;case 32:return 8;case 6:return 16;case 8:return 32;case 12:return 64;case 14:return 128;case 58:return 256;case 56:return 512;case 36:return 1024;case 48:case 53:return 2048;case 3:return 4096;case 17:return 8192;case 4:return 16384;case 5:return 32768;default:return 0;}}
@@ -43,6 +52,7 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==KEY_ASPECT_TOGGLE)runtime_aspect_toggle();}
 void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
 void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
+void runtime_input_suppress(int on){atomic_store(&input_suppressed,on!=0);if(on)runtime_input_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
    the same input is the handheld controller (id 0x20, style bit 1, joy-cons attached) and player 1 is not connected;
@@ -72,6 +82,7 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
+ if(atomic_load(&input_suppressed)){state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;}
  }*out=state;pthread_mutex_unlock(&inputLock);return 1;}
 static int disconnected_states(NpadState *out,int max,const uint32_t *id){if(id)input_log("joy-con state",*id);if(max<=0)return 0;if(!out)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);*out=(NpadState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
 static void hold_type(int type){if(type<0||type>1)runtime_fail("invalid joy hold type");holdType=type;(void)holdType;}
@@ -137,12 +148,14 @@ __attribute__((constructor)) static void input_script_start(void) {
    kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
 extern void runtime_front_request_close(void);
-static void *input_file(void *arg) {
-    FILE *f = fopen((const char *)arg, "r"); if (!f) runtime_fail("cannot open TOTK_INPUT_FILE");
+static int input_file_stop;
+static void input_file_on_line(const char *text, void *ctx) {
+    (void)ctx;
     char line[1200];
-    for (;;) {
-        if (!fgets(line, sizeof line, f)) { if (ferror(f)) runtime_fail("diagnostic input read"); clearerr(f); usleep(100000); continue; }
-        if (runtime_survey_command(line)) continue;
+    size_t n = strlen(text);
+    if (n >= sizeof line) runtime_fail("diagnostic input line too long");
+    memcpy(line, text, n + 1);
+    if (runtime_survey_command(line)) return;
         unsigned code, ms; int used = 0;
         if (sscanf(line, "down %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
             fprintf(stderr,"[totk-input] file: key %u down\n",code);runtime_input_key_synthetic(code,1);
@@ -157,10 +170,17 @@ static void *input_file(void *arg) {
             extern void dm_gfx_anomdump(void); dm_gfx_anomdump();
         } else if (sscanf(line, "querylog %u %n", &code, &used) == 1 && used && !line[used] && code > 0 && code <= 600) {
             extern void dm_gfx_querylog_next(long n); dm_gfx_querylog_next((long)code);   /* occlusion query results of the next n frames */
+        } else if (!strncmp(line, "swkbddefault ", 13) || !strncmp(line, "flag swkbddefault ", 18)) {
+            const char *p = line[0] == 'f' ? line + 18 : line + 13;
+            char name[64]; size_t n = strcspn(p, "\r\n");
+            if (!n || n >= sizeof name) fprintf(stderr, "[swkbd] default name rejected\n");
+            else { memcpy(name, p, n); name[n] = 0; runtime_swkbd_set_default(name); }
         } else if (!strncmp(line, "flag ", 5)) {
             /* "flag <name> <0|1>": switch a graphics behaviour while the game runs (A/B without restarting); rumble / gyro mute and unmute those */
             char name[64]; int v; if (sscanf(line + 5, "%63s %d", name, &v) != 2) runtime_fail("diagnostic flag needs <name> <0|1>");
-            extern void dm_gfx_set_flag(const char *name, int v); if (!runtime_hid_feedback_flag(name, v)) dm_gfx_set_flag(name, v);
+            extern void dm_gfx_set_flag(const char *name, int v);
+            extern int audio_host_restart_flag(const char *name, int v);
+            if (!runtime_hid_feedback_flag(name, v) && !audio_host_restart_flag(name, v)) dm_gfx_set_flag(name, v);
         } else if (!strncmp(line, "texdump ", 8)) {
             extern void dm_gfx_texdump_next(const char *path);
             line[strcspn(line, "\r\n")] = 0; if (!line[8] || !strstr(line + 8, "%d")) runtime_fail("diagnostic texdump path needs %d");
@@ -191,12 +211,24 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
-        } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
+        }         else if (!strcmp(line, "close\n")) { runtime_front_request_close(); input_file_stop = 1; }
         else runtime_fail("invalid diagnostic input command");
+}
+static void *input_file(void *arg) {
+    input_file_reader reader;
+    input_file_reader_init(&reader, arg);
+    free(arg);
+    if (!reader.path) runtime_fail("diagnostic input path");
+    for (;;) {
+        input_file_reader_poll(&reader, input_file_on_line, NULL, runtime_fail);
+        if (input_file_stop) break;
+        usleep(100000);
     }
-    fclose(f); return NULL;
+    input_file_reader_close(&reader);
+    return NULL;
 }
-__attribute__((constructor)) static void input_file_start(void) {
-    const char *e = getenv("TOTK_INPUT_FILE"); if (!e || !*e) return;
-    pthread_t t; if (pthread_create(&t, NULL, input_file, (void *)e)) runtime_fail("diagnostic input thread"); pthread_detach(t);
+void runtime_input_file_start(void) {
+    input_file_ensure_started(getenv("TOTK_INPUT_FILE"), input_file, runtime_fail);
 }
+/* Mac: the launcher execs this process with TOTK_INPUT_FILE already set. iOS sets it later and calls again. */
+__attribute__((constructor)) static void input_file_start(void) { runtime_input_file_start(); }

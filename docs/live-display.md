@@ -1,19 +1,28 @@
 # Live scene geometry
 
-The base-1.0.0 iPad/Duo profile uses the verified 4:3 resource preparation and
-adapts its camera, viewport and HUD together to landscape scene aspects from 1:1
-through 16:9. Select `--display duo` or `--display ipad`; they prepare the same
-narrow profile. The separate `--display iphone` preparation remains static
-239:110 for conventional wide phones. A narrow build on an unsupported scene
-shape explicitly returns to a centered 4:3 fit rather than retaining an old
-camera ratio. The game view always preserves the completed source's proportions.
+The base-1.0.0 iPad/Duo profile uses the verified 4:3 resource preparation for
+the whole session. Select `--display duo` or `--display ipad`; they prepare the
+same narrow profile. The picture is the verified 4:3 camera, viewport and HUD,
+centered in the scene's safe rectangle. A wider landscape keeps constant black
+side bars through gameplay and dialogue. A pre-rendered 1920×1080 cutscene is
+fitted at 16:9 inside that picture, so the side bars stay put. The separate
+`--display iphone` preparation remains static 239:110 for conventional wide
+phones.
+
+The previous live path published the device aspect into the camera and stretched
+the 4:3 framebuffer to the drawable. A 16:9 movie drawn through that viewport
+was distorted. An unqualified dialogue layout counted as a HUD miss, forced the
+next interval back to 4:3, and presentation then added side bars only while that
+layout was up. Stable mode keeps the 4:3 camera even when a dialogue layout is
+outside the qualified HUD set. These checks are source tests. They do not show
+that an iPhone Duo, or any device, has been played with this picture.
 
 UIKit supplies the actual scene bounds, native display scale, safe areas and
 orientation. It does not select a device identifier or assume a fold posture.
 Invalid or zero intermediate sizes preserve the last valid request. The existing
 internal render-resolution preference and pixel-height budget stay independent
-of scene aspect. The narrow view fills the scene; immutable source metadata tells
-the renderer how to fit a completed native frame or an explicit fallback.
+of scene aspect. The narrow view is the stable 4:3 picture. Immutable source metadata still tells
+the renderer how to fit a completed native frame when the stable flag is off.
 
 The supported builder derives a private layout header from exact verified
 executable and RomFS inputs, a pinned GPL display rule source and the prepared
@@ -43,17 +52,16 @@ physical controller state and its existing haptic lifecycle are preserved.
 
 Evidence is scoped. CPU fixtures run exact private Pane/Calculate instructions,
 native capture branches, current animation/safe anchors, fallback/recovery and the
-code-export/read-only-text binding path. A continuous real Mac gameplay recording
-was checked while actual Duo Simulator scene changes drove Open → Closed → Open,
-including Link movement, camera control, jumping, hints and autosave. Its complete
-UIKit-root frames preserved world/HUD proportions and a circular, safely anchored
-minimap in both postures. This was Mac gameplay relayed into a UIKit viewer, not
-game execution on Simulator or physical Duo hardware. All-game/all-menu behavior,
-physical foldable performance and device controls in this new build remain
-unverified. Device installation and testing are separate release steps.
+code-export/read-only-text binding path. An earlier Mac gameplay recording checked
+the previous dynamic-aspect path while Duo Simulator scene changes drove
+Open → Closed → Open. That recording does not cover the stable 4:3 picture or the
+cutscene fit. It was Mac gameplay relayed into a UIKit viewer, not game execution
+on Simulator or physical Duo hardware. All-game/all-menu behavior, physical
+foldable performance and device controls remain unverified. Device installation
+and testing are separate release steps.
 
 Run the game-free geometry and profile regressions with `python3 -m unittest
-discover -s tests -p 'test_ios_display_profiles.py' -v` and the corresponding
-`test_live_display_geometry.py`. The private exact-code test is
+discover -s tests -p 'test_ios_display_profiles.py' -v`,
+`test_live_display_geometry.py`, and `test_stable_presentation.py`. The private exact-code test is
 `tests/test_live_layout_matrix.py --private-tree /path/to/verified/totk --paired`;
 it disposes compiler products and never runs the game or touches saves/devices.

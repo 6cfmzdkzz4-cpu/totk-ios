@@ -166,8 +166,10 @@ static void overlay_load(const char *dir,int required) {
   if(!known&&!add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
   if(known&&add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
   Entry e={0};if(known){e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
-  char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY|O_CLOEXEC);struct stat st;
-  need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
+  char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");
+  int fd=open(file,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);struct stat st;
+  if(fd<0&&errno==ELOOP){fprintf(stderr,"[totk] RomFS overlay: %s is a symlink\n",file);runtime_fail("RomFS overlay refuses a symlink");}
+  need(fd>=0&&fstat(fd,&st)==0&&S_ISREG(st.st_mode)&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
   hashed+=e.size+size;
   if(noverlay==overlay_cap){overlay_cap=overlay_cap?overlay_cap*2:16;overlays=realloc(overlays,overlay_cap*sizeof(*overlays));need(overlays!=NULL,"RomFS overlay table");}
   char *copy=strdup(file),*rel=strdup(name);need(copy&&rel,"RomFS overlay path copy");overlays[noverlay++]=(Overlay){i,size,copy,st.st_dev,st.st_ino,st.st_mtimespec,rel};

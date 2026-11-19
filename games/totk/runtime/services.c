@@ -15,6 +15,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>   /* os_proc_available_memory(): iOS/iPadOS only; unavailable on macOS */
+#endif
+#include <dispatch/dispatch.h>
 /* Guest address layout. The SDK encodes IPC buffer addresses with 39 bits (HIPC descriptor bits 36..38),
    so all guest memory must lie below 2^39. Darwin arm64 keeps 0x10_0000_0000..0x70_0000_0000 reserved,
    leaving exactly 64 GiB at 0x70_0000_0000 for the alias region (the real 39-bit Horizon size, which the
@@ -47,6 +51,8 @@ static uint64_t alias_size(void){if(!alias_len)alias_len=alias_requested();retur
 #define HEAP_OFF (STACK_OFF+STACK_SIZE+0x10000000ULL)
 static uint8_t *alias_space,*low_space,*heap;
 static size_t heap_size;
+static void host_budget_log(const char *reason, uint64_t failed_bytes);
+static void host_pressure_watch(void);
 static unsigned char alias_pages[ALIAS_SIZE_MAX/4096];
 /* 4 KiB guest pages that are unmapped but whose host 16 KiB page is still committed with old contents: only these are
    zeroed when mapped again. Every other free page is untouched anonymous memory (zero on first touch), so mapping does
@@ -120,6 +126,8 @@ static void memory_init(void) {
 #endif
  heap=low_space+HEAP_OFF;
  fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+ host_budget_log("startup",0);
+ host_pressure_watch();
 }
 /* Scoped stack moves: independent host backing, copy back on unmap.
  * Logical accounting is 4 KiB; Darwin protections are rounded to 16 KiB.
@@ -204,6 +212,37 @@ void runtime_guest_resident(uint64_t *resident,uint64_t *dirty,uint64_t *compres
  *resident=*dirty=*compressed=0;if(!low_space)return;
  region_pages((uintptr_t)low_space,(uintptr_t)low_space+LOW_SIZE,resident,dirty,compressed);
  region_pages(ALIAS_START,ALIAS_START+ALIAS_SIZE,resident,dirty,compressed);
+}
+static void host_budget_log(const char *reason, uint64_t failed_bytes) {
+ task_vm_info_data_t info; mach_msg_type_number_t count=TASK_VM_INFO_COUNT; memset(&info,0,sizeof info);
+ kern_return_t kr=task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&info,&count);
+ unsigned long long footprint=kr==KERN_SUCCESS?(unsigned long long)info.phys_footprint:0;
+ unsigned long long resident=kr==KERN_SUCCESS?(unsigned long long)info.resident_size:0;
+ /* available is bytes still allowed before the process limit. os_proc_available_memory() exists on iOS and is
+    unavailable on macOS. The macOS line uses available=-1 and available_status=unavailable. -1 is not a byte count
+    and is not zero headroom. */
+#if TARGET_OS_IPHONE
+ long long available=(long long)os_proc_available_memory();
+ const char *available_status="measured";
+#else
+ long long available=-1;
+ const char *available_status="unavailable";
+#endif
+ fprintf(stderr,"[totk-mem] budget unix=%lld reason=%s footprint=%llu resident=%llu available=%lld available_status=%s failed_bytes=%llu pool=%#llx heap=%#llx alias_mapped=%#llx\n",
+  (long long)time(NULL),reason,footprint,resident,available,available_status,(unsigned long long)failed_bytes,(unsigned long long)APP_POOL,(unsigned long long)heap_size,(unsigned long long)alias_bytes);
+}
+static void host_pressure_event(void *context) {
+ unsigned long mask=dispatch_source_get_data((dispatch_source_t)context);
+ host_budget_log(mask&DISPATCH_MEMORYPRESSURE_CRITICAL?"pressure-critical":mask&DISPATCH_MEMORYPRESSURE_WARN?"pressure-warn":"pressure-normal",0);
+}
+static void host_pressure_watch(void) {
+ static dispatch_source_t source;
+ if(source)return;
+ source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,DISPATCH_MEMORYPRESSURE_NORMAL|DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+ if(!source)return;
+ dispatch_set_context(source,source);
+ dispatch_source_set_event_handler_f(source,host_pressure_event);
+ dispatch_resume(source);
 }
 static void host_diag_init(void) { fprintf(stderr,"[totk] native diagnostics initialized\n"); }
 static void host_oe_init(void) { fprintf(stderr,"[totk] application environment: local macOS process\n"); }
@@ -338,7 +377,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  }
  case 0x2c:case 0x2d:{uint64_t a=r[0],n=r[1];r[0]=alias_map(num==0x2d,a,n);
   if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] %sMapPhysicalMemory %#llx+%#llx -> %#llx alias=%#llx remaining=%#llx\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)(APP_POOL-runtime_image_bytes()-heap_size-alias_bytes));
-  if(r[0])fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)heap_size);return r[0];}
+  if(r[0]){host_budget_log(num==0x2d?"unmap_physical_failed":"map_physical_failed",n);fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)heap_size);}return r[0];}
  case 0x04:case 0x05:r[0]=stack_move(num==5,r[0],r[1],r[2]);return r[0];
  case 0x06: {
   uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
@@ -367,7 +406,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   if(r[0])memcpy((void *)(uintptr_t)r[0],&info,sizeof(info));r[0]=0;r[1]=0;return 0;
  }
  case 0x01:{size_t size=r[1];if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] SetHeapSize %#zx (image=%#llx alias=%#llx pool=%#llx)\n",size,(unsigned long long)runtime_image_bytes(),(unsigned long long)alias_bytes,(unsigned long long)APP_POOL);
-  if(size>HEAP_CAP||size%0x200000||size+runtime_image_bytes()>APP_POOL){r[0]=0xd401;return r[0];}
+  if(size>HEAP_CAP||size%0x200000||size+runtime_image_bytes()>APP_POOL){host_budget_log("set_heap_refused",size);r[0]=0xd401;return r[0];}
   if(size>heap_size&&mprotect(heap+heap_size,size-heap_size,PROT_READ|PROT_WRITE))runtime_fail("commit heap");
   if(size<heap_size&&mprotect(heap+size,heap_size-size,PROT_NONE))runtime_fail("decommit heap");heap_size=size;r[0]=0;r[1]=(uintptr_t)heap;return 0;}
  case 0x0c: r[0]=0;r[1]=44;return 0;

@@ -33,4 +33,5 @@ void *movie_host_entry(int which);                   /* the host implementation 
 void *runtime_movie_override(const char *name);
 void movie_host_tick(void);                          /* every present: hand over decoded frames that are due */
 void movie_host_set_clock(uint64_t (*clock)(void));  /* probe only: a fake clock (ns) for the pacing */
+int movie_host_cutscene_active(void);                /* 1 while a started decoder is exactly 16:9 */
 #endif
